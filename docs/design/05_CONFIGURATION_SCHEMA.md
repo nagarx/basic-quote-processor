@@ -889,9 +889,11 @@ Higher temporal resolution for investigating short-horizon signals. Produces mor
 data_dir = "../data/XNAS_BASIC/NVDA/cmbp1_2025-02-03_to_2026-01-09"
 equs_summary_path = "../data/EQUS_SUMMARY/NVDA/ohlcv1d_2025-02-03_to_2026-03-05/equs-summary-*.ohlcv-1d.dbn.zst"
 filename_pattern = "xnas-basic-{date}.cmbp-1.dbn.zst"
+symbol = "NVDA"
+
+[dates]
 start_date = "2025-02-03"
 end_date = "2026-01-08"
-symbol = "NVDA"
 
 [sampling]
 strategy = "time_based"
@@ -930,7 +932,7 @@ stride = 1
 [export]
 output_dir = "../data/exports/basic_nvda_10s"
 split_dates = { train_end = "2025-09-30", val_end = "2025-11-13" }
-normalization = "per_day_zscore"
+normalization = "none"               # raw export — Python normalizes (T15)
 
 [validation]
 min_trades_per_bin = 3               # Lower threshold: ~630 avg TRF trades per 10s bin
@@ -975,9 +977,11 @@ Enables VPIN computation alongside standard time-based features. VPIN uses a par
 data_dir = "../data/XNAS_BASIC/NVDA/cmbp1_2025-02-03_to_2026-01-09"
 equs_summary_path = "../data/EQUS_SUMMARY/NVDA/ohlcv1d_2025-02-03_to_2026-03-05/equs-summary-*.ohlcv-1d.dbn.zst"
 filename_pattern = "xnas-basic-{date}.cmbp-1.dbn.zst"
+symbol = "NVDA"
+
+[dates]
 start_date = "2025-02-03"
 end_date = "2026-01-08"
-symbol = "NVDA"
 
 [sampling]
 strategy = "time_based"              # Time-based for main features; VPIN uses internal volume bars
@@ -1033,7 +1037,7 @@ close_detection_gap_bins = 10
 # trf = [82, 83]
 # lit = [81]
 # minor_lit = [88, 89]
-include_minor_lit_in_lit = true
+# include_minor_lit_in_lit = true
 ```
 
 **Key differences from default**:

@@ -25,7 +25,7 @@ Key capabilities:
 # Build
 cargo build --release
 
-# Run all tests (365 lib + 47 integration)
+# Run all tests (408 lib + 63 integration)
 cargo test
 
 # Lint
@@ -68,7 +68,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
                     dates.rs --> weekday enumeration, split assignment
 ```
 
-13 modules, 41 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 5 integration test files, **412 tests** (365 lib + 47 integration).
+13 modules, 41 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 6 integration test files, **471 tests** (408 lib + 63 integration).
 
 ## Feature Groups (34 total, indices 0-33)
 
@@ -101,7 +101,7 @@ Categorical (non-normalizable): [29, 30, 32, 33]. See `docs/design/04_FEATURE_SP
 
 Configuration is TOML-based with 11 sections: `[input]`, `[sampling]`, `[classification]`, `[features]`, `[vpin]`, `[validation]`, `[sequence]`, `[labeling]`, `[dates]`, `[export]`, `[export.split_dates]`. See `configs/nvda_60s.toml` for a production example.
 
-Full config reference: `docs/design/05_CONFIGURATION_SCHEMA.md` (1,039 lines covering every parameter, valid ranges, defaults, and validation rules).
+Full config reference: `docs/design/05_CONFIGURATION_SCHEMA.md` (1,111 lines covering every parameter, valid ranges, defaults, and validation rules).
 
 ## Data Requirements
 
@@ -146,7 +146,7 @@ OHLCV-1D consolidated daily summary. Used for coverage validation and context fe
 
 ## Testing
 
-412 tests total: 365 library unit tests + 47 integration tests.
+471 tests total: 408 library unit tests + 63 integration tests.
 
 Integration tests require Databento XNAS.BASIC CMBP-1 data files. All integration tests are gated by `data_available()` and skip gracefully when data is not present — `cargo test` will always succeed on a fresh clone, but integration tests will report as passed (skipped) rather than ignored.
 

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::contract::{CONTRACT_VERSION, SCHEMA_VERSION, TOTAL_FEATURES};
 use crate::error::{ProcessorError, Result};
@@ -38,6 +38,21 @@ pub struct ExportMetadata {
     pub export_timestamp: String,
 
     // ── Bin statistics ───────────────────────────────────────────────
+    //
+    // Bin accounting invariants (Round 8 doc clarification):
+    //   `n_bins_total`          = post-warmup emitted bins (ALL — includes those
+    //                              with valid labels AND those with NaN labels
+    //                              beyond max-horizon tail).
+    //   `n_bins_valid`          = bins whose labels are all finite across every
+    //                              configured horizon (becomes sequence endpoints).
+    //   `n_bins_label_truncated` = bins where at least one horizon yields NaN
+    //                              (typically the last max_horizon bins of the day).
+    //   `n_bins_warmup_discarded` = bins dropped during warmup (NOT counted in
+    //                              `n_bins_total` — they are pre-warmup).
+    //
+    // Invariant: `n_bins_total == n_bins_valid + n_bins_label_truncated`.
+    //            `n_bins_warmup_discarded` is ORTHOGONAL (counts pre-warmup bins
+    //            that never contribute to n_bins_total).
     /// UTC nanoseconds since epoch. First emitted bin's start time.
     pub first_bin_start_ns: u64,
     /// UTC nanoseconds since epoch. Last emitted bin's end time.
@@ -57,6 +72,13 @@ pub struct ExportMetadata {
     pub data_source: String,
     pub schema: String,
     pub symbol: String,
+    /// Phase 9.4 / D13: Experiment identifier from
+    /// `DatasetExportConfig::experiment`. Makes metadata self-identifying
+    /// without requiring a sibling `dataset_manifest.json` lookup. Omitted
+    /// (skipped on serialize) for pre-Phase-9 compat — new exports always
+    /// emit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<String>,
 
     // ── EQUS context ─────────────────────────────────────────────────
     pub equs_summary_available: bool,
@@ -70,6 +92,47 @@ pub struct ExportMetadata {
     pub classification_config: serde_json::Value,
     pub signing_method: String,
     pub exclusion_band: f64,
+
+    // ── Forward-price trajectory export (Phase 9.1) ──────────────────
+    /// Metadata for the `{day}_forward_prices.npy` file. Required by
+    /// `hft-contracts.ForwardPriceContract.from_metadata()` for the
+    /// T9 `LabelFactory` pathway (on-the-fly label recomputation).
+    ///
+    /// Emitted when present; absent in legacy v0 metadata produced before
+    /// Phase 9 (handled by `#[serde(skip_serializing_if)]` and `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_prices: Option<ForwardPricesMeta>,
+}
+
+/// Metadata describing the `{day}_forward_prices.npy` file.
+///
+/// Contract: `contracts/pipeline_contract.toml [forward_prices.metadata]`
+/// Consumer: `hft-contracts/label_factory.py::ForwardPriceContract.from_metadata()`
+///
+/// `basic-quote-processor` exports forward prices with layout
+/// `forward_prices[t][k] = mid_price[t + k]` (column 0 = base price at t,
+/// column h = price at t+h). There is **no** past smoothing window — hence
+/// `smoothing_window_offset = 0` and `n_columns = max_horizon + 1`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardPricesMeta {
+    /// Always `true` for new exports (file is always written alongside metadata).
+    /// Consumers check this before attempting to load the `.npy` file.
+    pub exported: bool,
+    /// The `k` parameter (past-smoothing column offset). **Always 0** for
+    /// basic-quote-processor — column 0 IS the base price at t.
+    pub smoothing_window_offset: usize,
+    /// The `H` parameter: maximum forward horizon in bins. Equals
+    /// `LabelConfig::max_horizon()` at export time.
+    pub max_horizon: usize,
+    /// Total columns in the `.npy` file: `k + H + 1` (invariant enforced by
+    /// `hft-contracts.ForwardPriceContract.__post_init__`).
+    pub n_columns: usize,
+    /// Unit of the prices. Always `"USD"` for basic-quote-processor
+    /// (converted from raw i64 nanodollars at Phase 3 boundary).
+    pub units: String,
+    /// Human-readable layout description. Documentation-only — the Python
+    /// consumer does NOT parse this field.
+    pub column_layout: String,
 }
 
 /// Normalization metadata embedded in export metadata.
@@ -114,6 +177,9 @@ pub struct ExportMetadataBuilder {
     bin_size_seconds: Option<u32>,
     market_open_et: Option<String>,
     normalization_applied: bool,
+    /// F5 → 9.5: Strategy string emitted in metadata.normalization.strategy.
+    /// Default "none" (matches current production config).
+    normalization_strategy: String,
     normalization_params_file: Option<String>,
     provenance_source_file: Option<String>,
     export_timestamp: Option<String>,
@@ -136,6 +202,8 @@ pub struct ExportMetadataBuilder {
     signing_method: Option<String>,
     exclusion_band: f64,
     config_hash: Option<String>,
+    forward_prices: Option<ForwardPricesMeta>,
+    experiment: Option<String>,
 }
 
 impl ExportMetadataBuilder {
@@ -148,6 +216,7 @@ impl ExportMetadataBuilder {
             bin_size_seconds: None,
             market_open_et: None,
             normalization_applied: false,
+            normalization_strategy: "none".to_string(),
             normalization_params_file: None,
             provenance_source_file: None,
             export_timestamp: None,
@@ -170,6 +239,8 @@ impl ExportMetadataBuilder {
             signing_method: None,
             exclusion_band: 0.10,
             config_hash: None,
+            forward_prices: None,
+            experiment: None,
         }
     }
 
@@ -180,6 +251,15 @@ impl ExportMetadataBuilder {
     pub fn bin_size_seconds(mut self, b: u32) -> Self { self.bin_size_seconds = Some(b); self }
     pub fn market_open_et(mut self, m: &str) -> Self { self.market_open_et = Some(m.to_string()); self }
     pub fn normalization_applied(mut self, a: bool) -> Self { self.normalization_applied = a; self }
+    /// Phase 9.5: set the normalization strategy string emitted in metadata.
+    ///
+    /// Valid values match `DatasetExportConfig::normalization` TOML validation:
+    /// `"none"` (default) or `"per_day_zscore"`. The builder does NOT validate
+    /// the string — validation is upstream in config parsing.
+    pub fn normalization_strategy(mut self, s: &str) -> Self {
+        self.normalization_strategy = s.to_string();
+        self
+    }
     pub fn normalization_params_file(mut self, f: &str) -> Self { self.normalization_params_file = Some(f.to_string()); self }
     pub fn provenance_source_file(mut self, f: &str) -> Self { self.provenance_source_file = Some(f.to_string()); self }
     pub fn export_timestamp(mut self, t: &str) -> Self { self.export_timestamp = Some(t.to_string()); self }
@@ -202,6 +282,26 @@ impl ExportMetadataBuilder {
     pub fn signing_method(mut self, m: &str) -> Self { self.signing_method = Some(m.to_string()); self }
     pub fn exclusion_band(mut self, b: f64) -> Self { self.exclusion_band = b; self }
     pub fn config_hash(mut self, h: &str) -> Self { self.config_hash = Some(h.to_string()); self }
+    /// Phase 9.4 / D13: Attach experiment identifier.
+    pub fn experiment(mut self, e: &str) -> Self { self.experiment = Some(e.to_string()); self }
+
+    /// Phase 9.1: Attach forward-prices metadata block (unlocks T9 LabelFactory).
+    ///
+    /// `max_horizon` must match `LabelConfig::max_horizon()` at export time.
+    /// `smoothing_window_offset` is hardcoded to 0 because basic-quote-processor
+    /// exports `forward_prices[t][k] = mid_price[t + k]` with column 0 = base
+    /// price at t (no past smoothing). `n_columns = k + H + 1 = 0 + H + 1 = H + 1`.
+    pub fn forward_prices(mut self, max_horizon: usize) -> Self {
+        self.forward_prices = Some(ForwardPricesMeta {
+            exported: true,
+            smoothing_window_offset: 0,
+            max_horizon,
+            n_columns: max_horizon + 1,
+            units: "USD".to_string(),
+            column_layout: "column_0_is_base_price_at_t; column_h_is_price_at_t_plus_h".to_string(),
+        });
+        self
+    }
 
     /// Build the ExportMetadata. Validates that required fields are set.
     pub fn build(self) -> Result<ExportMetadata> {
@@ -229,7 +329,10 @@ impl ExportMetadataBuilder {
             bin_size_seconds,
             market_open_et: self.market_open_et.unwrap_or_else(|| "09:30".to_string()),
             normalization: NormalizationMeta {
-                strategy: "per_day_zscore".to_string(),
+                // Phase 9.5: strategy is now configured, not hardcoded. Upstream
+                // validation (DatasetExportConfig::validate) enforces it is one
+                // of {"none", "per_day_zscore"} when loaded from the CLI config.
+                strategy: self.normalization_strategy,
                 applied: self.normalization_applied,
                 params_file: norm_params_file,
             },
@@ -262,6 +365,8 @@ impl ExportMetadataBuilder {
                 .unwrap_or(serde_json::json!({})),
             signing_method: self.signing_method.unwrap_or_else(|| "midpoint".to_string()),
             exclusion_band: self.exclusion_band,
+            forward_prices: self.forward_prices,
+            experiment: self.experiment,
         })
     }
 }
@@ -375,5 +480,178 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["day"], "2025-02-03");
+    }
+
+    // ── Phase 9.1: forward_prices metadata block tests ─────────────────
+
+    fn metadata_with_fp(max_h: usize) -> ExportMetadata {
+        ExportMetadata::builder()
+            .day("2025-02-03")
+            .n_sequences(100)
+            .window_size(20)
+            .horizons(vec![1, max_h])
+            .bin_size_seconds(60)
+            .forward_prices(max_h)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_metadata_includes_forward_prices_block() {
+        // When builder method is called, metadata must include all 6
+        // fields required by `hft-contracts.ForwardPriceContract.from_metadata()`.
+        let meta = metadata_with_fp(60);
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            parsed.get("forward_prices").is_some(),
+            "Metadata must include forward_prices block when builder.forward_prices() is called"
+        );
+        let fp = &parsed["forward_prices"];
+        assert_eq!(fp["exported"], true);
+        assert_eq!(fp["smoothing_window_offset"], 0);
+        assert_eq!(fp["max_horizon"], 60);
+        assert_eq!(fp["n_columns"], 61);
+        assert_eq!(fp["units"], "USD");
+        assert!(fp["column_layout"].is_string());
+    }
+
+    #[test]
+    fn test_forward_prices_n_columns_is_k_plus_h_plus_1() {
+        // Load-bearing invariant enforced by
+        // `hft-contracts.ForwardPriceContract.__post_init__` (label_factory.py:100-108).
+        // n_columns must equal smoothing_window_offset + max_horizon + 1.
+        for max_h in [1_usize, 5, 10, 30, 60, 100] {
+            let meta = metadata_with_fp(max_h);
+            let fp = meta.forward_prices.as_ref().expect("forward_prices set");
+            assert_eq!(
+                fp.n_columns,
+                fp.smoothing_window_offset + fp.max_horizon + 1,
+                "n_columns invariant violated for max_h={max_h}: \
+                 got n_columns={}, expected {}",
+                fp.n_columns,
+                fp.smoothing_window_offset + fp.max_horizon + 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_forward_prices_units_is_usd() {
+        // basic-quote-processor converts i64 nanodollars → f64 USD at the
+        // Phase 3 boundary. The `units` field must always be "USD".
+        let meta = metadata_with_fp(60);
+        assert_eq!(meta.forward_prices.unwrap().units, "USD");
+    }
+
+    #[test]
+    fn test_forward_prices_smoothing_offset_is_zero() {
+        // basic-quote-processor does NOT apply past-smoothing to forward
+        // prices. Column 0 IS the base price at t (not a smoothed average).
+        // If a future variant ever smooths, it must update both the storage
+        // layout AND this metadata field in lockstep.
+        let meta = metadata_with_fp(60);
+        assert_eq!(meta.forward_prices.unwrap().smoothing_window_offset, 0);
+    }
+
+    #[test]
+    fn test_metadata_without_forward_prices_skips_field() {
+        // Backward compat — if `forward_prices(...)` builder method is NOT
+        // called, the field is `None` and omitted from JSON output via
+        // `#[serde(skip_serializing_if = "Option::is_none")]`. This preserves
+        // compatibility with pre-Phase-9 metadata files.
+        let meta = minimal_metadata();
+        assert!(
+            meta.forward_prices.is_none(),
+            "Unset forward_prices must be Option::None"
+        );
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("forward_prices").is_none(),
+            "Unset forward_prices must be skipped in JSON output"
+        );
+    }
+
+    // ── Phase 9.5: normalization strategy honesty tests ────────────────
+
+    #[test]
+    fn test_metadata_strategy_default_is_none() {
+        // When no builder method is called, strategy defaults to "none" —
+        // matches the current production configs (all 47 use normalization = "none").
+        // Previously this was hardcoded to "per_day_zscore" regardless of config.
+        let meta = minimal_metadata();
+        assert_eq!(meta.normalization.strategy, "none");
+    }
+
+    #[test]
+    fn test_metadata_strategy_reflects_config_none() {
+        // Explicitly setting "none" via the builder produces "none" in JSON.
+        let meta = ExportMetadata::builder()
+            .day("2025-02-03")
+            .n_sequences(100)
+            .window_size(20)
+            .horizons(vec![1])
+            .bin_size_seconds(60)
+            .normalization_strategy("none")
+            .build()
+            .unwrap();
+        assert_eq!(meta.normalization.strategy, "none");
+        assert!(!meta.normalization.applied);
+
+        // Also verify JSON emission
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["normalization"]["strategy"], "none");
+    }
+
+    #[test]
+    fn test_metadata_experiment_field_when_set() {
+        // Round 7 / D13: experiment field emitted in JSON when builder called.
+        let meta = ExportMetadata::builder()
+            .day("2025-02-03")
+            .n_sequences(100)
+            .window_size(20)
+            .horizons(vec![1])
+            .bin_size_seconds(60)
+            .experiment("basic_nvda_60s_phase9")
+            .build()
+            .unwrap();
+        assert_eq!(meta.experiment.as_deref(), Some("basic_nvda_60s_phase9"));
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["experiment"], "basic_nvda_60s_phase9");
+    }
+
+    #[test]
+    fn test_metadata_experiment_field_skipped_when_unset() {
+        // Round 7 / D13: backward compat — without setter, field is skipped.
+        let meta = minimal_metadata();
+        assert!(meta.experiment.is_none());
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("experiment").is_none(),
+            "Unset experiment must be omitted from JSON (serde skip)"
+        );
+    }
+
+    #[test]
+    fn test_metadata_strategy_reflects_config_per_day_zscore() {
+        // Setting "per_day_zscore" via builder produces that exact string.
+        // (Used if/when Rust-side normalization is re-enabled; currently all
+        // production configs use "none" per T15.)
+        let meta = ExportMetadata::builder()
+            .day("2025-02-03")
+            .n_sequences(100)
+            .window_size(20)
+            .horizons(vec![1])
+            .bin_size_seconds(60)
+            .normalization_strategy("per_day_zscore")
+            .normalization_applied(true)
+            .build()
+            .unwrap();
+        assert_eq!(meta.normalization.strategy, "per_day_zscore");
+        assert!(meta.normalization.applied);
     }
 }

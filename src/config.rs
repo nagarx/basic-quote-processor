@@ -5,14 +5,14 @@
 //!
 //! Source: docs/design/05_CONFIGURATION_SCHEMA.md
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::error::{ProcessorError, Result};
 use crate::features::indices;
 
 /// Top-level processor configuration.
 ///
 /// Deserialized from a TOML file. All sections except `[input]` have defaults.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessorConfig {
     pub input: InputConfig,
@@ -52,12 +52,71 @@ impl ProcessorConfig {
         self.validation.validate()?;
         self.sequence.validate()?;
         self.labeling.validate()?;
+        self.vpin.validate()?;
         Ok(())
+    }
+
+    /// Canonical TOML serialization — the input to `config_hash_hex` (Phase 9.4).
+    ///
+    /// Uses `toml::to_string` (compact form) rather than `to_string_pretty` because
+    /// the compact format is less likely to drift across `toml` 0.8.x minor version
+    /// bumps (pretty-printing has more formatting freedom the crate may refine over
+    /// time). Field order is determined by struct declaration order — a documented
+    /// invariant of `serde_derive` + `toml` — so two runs with the same
+    /// `ProcessorConfig` always produce byte-identical output, even if the user's
+    /// original TOML text differed in comments, whitespace, or field order.
+    ///
+    /// Callers that need a human-readable view of the config should use
+    /// `toml::to_string_pretty(self)` directly; this helper is intentionally the
+    /// single canonical input to the SHA-256 hash.
+    pub fn to_canonical_toml(&self) -> Result<String> {
+        toml::to_string(self)
+            .map_err(|e| ProcessorError::config(format!("config serialize: {e}")))
+    }
+
+    /// SHA-256 hash of the canonical TOML serialization — 64-character lowercase hex.
+    ///
+    /// This is the **config provenance** field emitted in metadata.json at
+    /// `provenance.config_hash`. It uniquely identifies the processing configuration
+    /// that produced an export — two runs with structurally identical
+    /// `ProcessorConfig` instances produce identical hashes, even if the source TOML
+    /// files differ in comments, whitespace, or field order.
+    ///
+    /// # Scope
+    ///
+    /// Only `ProcessorConfig` contents are hashed — **not** the multi-day
+    /// orchestration fields (`DateRangeConfig`, `DatasetExportConfig`). This is
+    /// intentional: `config_hash` represents "processing identity" (what features,
+    /// what sampling, what labels), not "run identity" (when, where). Two runs
+    /// producing the same processed data to different `output_dir`s share a hash.
+    ///
+    /// # Canonicalization input
+    ///
+    /// The hash input is `toml::to_string(&self)` — the serialized form of the
+    /// derived `ProcessorConfig`, NOT the user's original TOML text. Two users
+    /// who write TOML files with different comments, whitespace, or field
+    /// order but which deserialize into structurally identical
+    /// `ProcessorConfig` instances produce byte-identical hashes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `toml::to_string` fails. For the current
+    /// `ProcessorConfig` layout (primitives + String + Option + Vec + enum),
+    /// this is effectively unreachable. Callers are still expected to have
+    /// called `validate()` beforehand to reject NaN/Inf floats — if NaN
+    /// reaches this helper, TOML emits `nan` as a literal and the hash is
+    /// deterministic-but-meaningless.
+    pub fn config_hash_hex(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let canonical = self.to_canonical_toml()?;
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }
 
 /// Input data configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     /// Directory containing .dbn.zst files.
@@ -81,7 +140,7 @@ fn default_symbol() -> String {
 /// Time-bin sampling configuration.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [sampling]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingConfig {
     /// Sampling strategy. Currently only "time_based" is supported.
@@ -140,7 +199,7 @@ fn default_market_close() -> String { "16:00".to_string() }
 /// per spec. Only the optional groups are toggleable here.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [features]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureConfig {
     /// Signed flow features (indices 0-3). Default: enabled.
@@ -204,7 +263,7 @@ fn default_true() -> bool { true }
 /// VPIN computation configuration.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [vpin]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VpinConfig {
     /// Shares per volume bar. Default: 5000.
@@ -239,6 +298,35 @@ impl Default for VpinConfig {
     }
 }
 
+impl VpinConfig {
+    /// Validate VPIN configuration parameters.
+    ///
+    /// F6 (Phase 9.4): `bucket_volume_fraction: Option<f64>` is explicitly
+    /// guarded against NaN/±Inf. Without this guard, `toml::to_string(&config)`
+    /// emits `bucket_volume_fraction = nan` (or `inf`) as literal TOML —
+    /// technically parseable but semantically meaningless. The resulting
+    /// `config_hash` would be deterministic but would describe an invalid
+    /// configuration. The guard enforces that only semantically valid
+    /// fractions (finite, in [0.0, 1.0]) ever reach the hash.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(frac) = self.bucket_volume_fraction {
+            if !frac.is_finite() {
+                return Err(ProcessorError::config(format!(
+                    "vpin.bucket_volume_fraction ({}) must be a finite value (not NaN/Inf)",
+                    frac
+                )));
+            }
+            if !(0.0..=1.0).contains(&frac) {
+                return Err(ProcessorError::config(format!(
+                    "vpin.bucket_volume_fraction ({}) must be in [0.0, 1.0]",
+                    frac
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_bucket_volume() -> u64 { 5000 }
 fn default_lookback() -> usize { 50 }
 fn default_sigma_window() -> u32 { 1 }
@@ -246,7 +334,7 @@ fn default_sigma_window() -> u32 { 1 }
 /// Validation and gating configuration.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [validation]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationConfig {
     /// Minimum TRF trades per bin for bin_valid gate. Default: 10.
@@ -333,7 +421,7 @@ impl ValidationConfig {
 /// Sequence building configuration.
 ///
 /// Source: docs/design/06_INTEGRATION_POINTS.md §1.3
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceConfig {
     /// Number of bins per sequence (sliding window length). Default: 20.
@@ -378,7 +466,7 @@ fn default_stride() -> usize { crate::contract::DEFAULT_STRIDE }
 /// Label strategy enum. Only point-return is supported for the off-exchange pipeline.
 ///
 /// Source: docs/design/04_FEATURE_SPECIFICATION.md §6
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LabelStrategy {
     /// Point-to-point forward return: (mid[t+H] - mid[t]) / mid[t] * 10000 bps
@@ -388,7 +476,7 @@ pub enum LabelStrategy {
 /// Label configuration.
 ///
 /// Source: docs/design/04_FEATURE_SPECIFICATION.md §6
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LabelConfig {
     /// Label strategy. Only "point_return" supported.
@@ -475,7 +563,7 @@ impl Default for ExportConfig {
 /// orchestration (dates, splits, export destination).
 ///
 /// Use `to_processor_config()` to extract a `ProcessorConfig` for `DayPipeline`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetConfig {
     pub input: InputConfig,
@@ -535,7 +623,7 @@ impl DatasetConfig {
 }
 
 /// Date range for multi-day processing.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DateRangeConfig {
     /// Start date (inclusive), YYYY-MM-DD.
@@ -569,7 +657,7 @@ impl DateRangeConfig {
 }
 
 /// Export destination and split configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetExportConfig {
     /// Output directory for exports.
@@ -625,7 +713,7 @@ impl DatasetExportConfig {
 }
 
 /// Train/val/test split date boundaries.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SplitDatesConfig {
     /// Last date of training set (inclusive), YYYY-MM-DD.
@@ -1025,5 +1113,285 @@ mod tests {
         "#;
         let config: DatasetConfig = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    // ── Phase 9.3 Serialize derive tests ──────────────────────────────
+
+    /// Sample processor config used by roundtrip tests.
+    fn sample_processor_config() -> ProcessorConfig {
+        ProcessorConfig {
+            input: InputConfig {
+                data_dir: "../data".to_string(),
+                filename_pattern: "test-{date}.dbn.zst".to_string(),
+                symbol: "NVDA".to_string(),
+                equs_summary_path: None,
+            },
+            sampling: SamplingConfig::default(),
+            classification: crate::trade_classifier::ClassificationConfig::default(),
+            features: FeatureConfig::default(),
+            vpin: VpinConfig::default(),
+            validation: ValidationConfig::default(),
+            sequence: SequenceConfig::default(),
+            labeling: LabelConfig::default(),
+        }
+    }
+
+    /// Sample dataset config used by roundtrip tests.
+    fn sample_dataset_config() -> DatasetConfig {
+        DatasetConfig {
+            input: InputConfig {
+                data_dir: "../data".to_string(),
+                filename_pattern: "test-{date}.dbn.zst".to_string(),
+                symbol: "NVDA".to_string(),
+                equs_summary_path: None,
+            },
+            sampling: SamplingConfig::default(),
+            classification: crate::trade_classifier::ClassificationConfig::default(),
+            features: FeatureConfig::default(),
+            vpin: VpinConfig::default(),
+            validation: ValidationConfig::default(),
+            sequence: SequenceConfig::default(),
+            labeling: LabelConfig::default(),
+            dates: DateRangeConfig {
+                start_date: "2025-02-03".to_string(),
+                end_date: "2026-01-06".to_string(),
+                exclude_dates: vec![],
+            },
+            export: DatasetExportConfig {
+                output_dir: "/tmp/output".to_string(),
+                split_dates: SplitDatesConfig {
+                    train_end: "2025-09-30".to_string(),
+                    val_end: "2025-11-13".to_string(),
+                },
+                normalization: "none".to_string(),
+                experiment: "test".to_string(),
+                continue_on_error: true,
+            },
+        }
+    }
+
+    #[test]
+    fn test_processor_config_serialize_roundtrip() {
+        // Round-trip the canonical TOML. A second serialization of the
+        // re-parsed config must byte-match the first — proves Serialize and
+        // Deserialize are inverses for the current struct layout.
+        let c1 = sample_processor_config();
+        let s1 = c1.to_canonical_toml().expect("serialize 1");
+        let c2: ProcessorConfig = toml::from_str(&s1).expect("deserialize");
+        let s2 = c2.to_canonical_toml().expect("serialize 2");
+        assert_eq!(s1, s2, "ProcessorConfig roundtrip must be byte-stable");
+    }
+
+    #[test]
+    fn test_dataset_config_serialize_roundtrip() {
+        // Same invariant for the multi-day CLI config (includes [dates] and
+        // [export] sections that ProcessorConfig does not have).
+        let c1 = sample_dataset_config();
+        let s1 = toml::to_string(&c1).expect("serialize 1");
+        let c2: DatasetConfig = toml::from_str(&s1).expect("deserialize");
+        let s2 = toml::to_string(&c2).expect("serialize 2");
+        assert_eq!(s1, s2, "DatasetConfig roundtrip must be byte-stable");
+    }
+
+    #[test]
+    fn test_label_strategy_enum_serializes_as_snake_case() {
+        // LabelStrategy has #[serde(rename_all = "snake_case")]. Verify
+        // Serialize honors the same rename as Deserialize: `PointReturn`
+        // variant serializes to "point_return" (exactly matches the
+        // `label_strategy` field already emitted in metadata.json).
+        let config = sample_processor_config();
+        let s = config.to_canonical_toml().expect("serialize");
+        assert!(
+            s.contains("label_type = \"point_return\""),
+            "Expected LabelStrategy::PointReturn → \"point_return\" snake_case, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn test_to_canonical_toml_uses_compact_form() {
+        // F3 invariant: helper uses toml::to_string (not pretty). The
+        // compact form lacks leading whitespace before section headers
+        // (pretty form would insert blank lines between sections).
+        let config = sample_processor_config();
+        let s = config.to_canonical_toml().expect("serialize");
+        // Compact form still emits [section] headers — we're verifying the
+        // absence of extra prettification by checking the output doesn't
+        // contain double blank lines.
+        assert!(
+            !s.contains("\n\n\n"),
+            "Compact form must not contain triple-newlines, got:\n{s}"
+        );
+    }
+
+    // ── Phase 9.4: config_hash_hex tests ───────────────────────────────
+
+    #[test]
+    fn test_config_hash_deterministic() {
+        // Two structurally identical configs must produce identical SHA-256 hashes.
+        // This is the load-bearing invariant for reproducibility.
+        let c1 = sample_processor_config();
+        let c2 = sample_processor_config();
+        let h1 = c1.config_hash_hex().expect("hash 1");
+        let h2 = c2.config_hash_hex().expect("hash 2");
+        assert_eq!(h1, h2, "Structurally identical configs must hash identically");
+    }
+
+    #[test]
+    fn test_config_hash_changes_on_param_change() {
+        // Changing a single processing parameter must change the hash —
+        // otherwise drift-detection is useless.
+        let c1 = sample_processor_config();
+        let mut c2 = sample_processor_config();
+        c2.sampling.bin_size_seconds = 30; // was 60 by default
+        let h1 = c1.config_hash_hex().expect("hash 1");
+        let h2 = c2.config_hash_hex().expect("hash 2");
+        assert_ne!(h1, h2, "bin_size_seconds change must change hash");
+    }
+
+    #[test]
+    fn test_config_hash_is_64_char_hex() {
+        // SHA-256 → 32 bytes → 64 lowercase hex chars. Load-bearing shape
+        // contract: consumers (EXPERIMENT_INDEX.md, trainer) will assume this.
+        let c = sample_processor_config();
+        let h = c.config_hash_hex().expect("hash");
+        assert_eq!(h.len(), 64, "SHA-256 hex must be 64 chars, got {}", h.len());
+        assert!(
+            h.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+            "Hash must be lowercase hex, got: {h}"
+        );
+    }
+
+    #[test]
+    fn test_config_hash_reflects_feature_toggle() {
+        // Toggling a feature group is a config-identity change → hash must differ.
+        let c1 = sample_processor_config();
+        let mut c2 = sample_processor_config();
+        c2.features.vpin = !c1.features.vpin;
+        assert_ne!(
+            c1.config_hash_hex().unwrap(),
+            c2.config_hash_hex().unwrap(),
+            "Feature toggle must change hash"
+        );
+    }
+
+    #[test]
+    fn test_config_hash_cross_struct_field_independence() {
+        // Round 7 (Agent 4 recommendation): each sub-config field contributes
+        // distinctly to the hash. Changing `SamplingConfig.bin_size_seconds`
+        // MUST produce a different hash from changing `SequenceConfig.window_size`
+        // by the same value. Rules out the bug where two fields in different
+        // sub-structs accidentally canonicalize to the same TOML bytes.
+        let baseline = sample_processor_config();
+        let mut c_sampling = sample_processor_config();
+        c_sampling.sampling.bin_size_seconds = 30;
+        let mut c_sequence = sample_processor_config();
+        c_sequence.sequence.window_size = 30;
+
+        let h0 = baseline.config_hash_hex().unwrap();
+        let h_samp = c_sampling.config_hash_hex().unwrap();
+        let h_seq = c_sequence.config_hash_hex().unwrap();
+
+        assert_ne!(h0, h_samp, "bin_size_seconds change must change hash");
+        assert_ne!(h0, h_seq, "window_size change must change hash");
+        assert_ne!(
+            h_samp, h_seq,
+            "Changes in sibling sub-structs must produce DISTINCT hashes — \
+             rules out cross-struct canonicalization collisions"
+        );
+    }
+
+    #[test]
+    fn test_to_canonical_toml_equals_compact_form_byte_for_byte() {
+        // Round 7 (Agent 4 recommendation) — stronger than the previous
+        // "no triple-newlines" check. Asserts the helper delegates to
+        // `toml::to_string` exactly (compact form), so a future accidental
+        // switch back to `to_string_pretty` would fail this test loudly
+        // even before `config_hash` consumers notice drift.
+        let config = sample_processor_config();
+        let via_helper = config.to_canonical_toml().expect("helper");
+        let via_direct = toml::to_string(&config).expect("direct to_string");
+        assert_eq!(
+            via_helper, via_direct,
+            "to_canonical_toml must be byte-identical to toml::to_string output"
+        );
+    }
+
+    // ── F6 (Phase 9.4): VpinConfig NaN/Inf guard tests ─────────────────
+
+    #[test]
+    fn test_vpin_bucket_volume_fraction_nan_rejected() {
+        // Without this guard, `toml::to_string(&config)` panics when
+        // computing `config_hash_hex`. Validation must reject NaN at the
+        // system boundary.
+        let config = VpinConfig {
+            bucket_volume_fraction: Some(f64::NAN),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("bucket_volume_fraction"),
+            "Error should mention field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vpin_bucket_volume_fraction_inf_rejected() {
+        let config = VpinConfig {
+            bucket_volume_fraction: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err(), "Inf fraction must be rejected");
+    }
+
+    #[test]
+    fn test_vpin_bucket_volume_fraction_neg_inf_rejected() {
+        let config = VpinConfig {
+            bucket_volume_fraction: Some(f64::NEG_INFINITY),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err(), "-Inf fraction must be rejected");
+    }
+
+    #[test]
+    fn test_vpin_bucket_volume_fraction_out_of_range_rejected() {
+        let config = VpinConfig {
+            bucket_volume_fraction: Some(1.5),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "Error should mention range: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vpin_bucket_volume_fraction_valid_accepted() {
+        // Legitimate fraction (2%) must validate cleanly.
+        let config = VpinConfig {
+            bucket_volume_fraction: Some(0.02),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vpin_none_fraction_accepted() {
+        // None is the default; must not trip the NaN guard.
+        let config = VpinConfig::default();
+        assert!(config.bucket_volume_fraction.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vpin_validate_propagates_through_processor_config() {
+        // NaN in a nested config must be caught by ProcessorConfig::validate,
+        // not just direct VpinConfig::validate.
+        let mut pc = sample_processor_config();
+        pc.vpin.bucket_volume_fraction = Some(f64::NAN);
+        assert!(
+            pc.validate().is_err(),
+            "Nested NaN must propagate through ProcessorConfig::validate"
+        );
     }
 }

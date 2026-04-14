@@ -102,6 +102,23 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
     let mut pipeline = DayPipeline::new(&processor_config)?;
     let apply_norm = config.export.normalization != "none";
 
+    // Phase 9.4 — canonical config hash for metadata provenance. Computed once
+    // from ProcessorConfig (processing identity only — dates/output_dir/experiment
+    // are not included so the same processing config produces the same hash across
+    // different date ranges or output locations).
+    let config_hash = processor_config.config_hash_hex()?;
+    eprintln!("config_hash: {}", config_hash);
+    pipeline.set_config_hash(config_hash.clone());
+
+    // Phase 9.5 — thread the actual configured normalization strategy into
+    // metadata. Replaces the previously-hardcoded "per_day_zscore" string.
+    pipeline.set_normalization_strategy(config.export.normalization.clone());
+    // Phase 9.4 — honest `applied` field paired with the strategy above.
+    // Under T15 ("Raw Rust"), `apply_norm` is false for every production config.
+    pipeline.set_normalization_applied(apply_norm);
+    // Phase 9.4 / D13 — self-identifying metadata: experiment name from config.
+    pipeline.set_experiment(config.export.experiment.clone());
+
     let mut manifest = DatasetManifest::new(
         &config.export.experiment,
         &config.input.symbol,
@@ -111,6 +128,10 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
         config.labeling.horizons.clone(),
         &config.export.normalization,
     );
+    // Phase 9.4 — surface the per-run config hash at the dataset level so
+    // `dataset_manifest.json` is self-identifying without reading every
+    // per-day metadata file.
+    manifest.set_config_hash(&config_hash);
 
     // Process each date
     let total = all_dates.len();
@@ -125,7 +146,10 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
         let file_path = match file_map.get(&date_str) {
             Some(p) => p.clone(),
             None => {
-                log::debug!("No data file for {iso_str}, skipping");
+                // Round 8 (Agent E2.4 fix): surface missing-file events at
+                // `warn!` (not `debug!`) so they appear in the default log.
+                // Silent skipping has hidden typo'd `filename_pattern` bugs.
+                log::warn!("No data file for {iso_str}, skipping");
                 continue;
             }
         };
@@ -133,6 +157,16 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
         let timer = Instant::now();
         let context = context_loader.get(*date);
         let (year, month, day) = dates::parse_file_date(&date_str)?;
+
+        // F1 — set the source file basename for this day's metadata provenance.
+        // Basename (not full path) keeps metadata portable across machines; the
+        // full path embeds user-specific filesystem layout.
+        let source_basename = file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        pipeline.set_source_file(source_basename);
 
         // Process day
         pipeline.init_day_with_context(year, month, day, Some(context));

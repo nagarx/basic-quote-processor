@@ -532,7 +532,7 @@ for each bin boundary:
     else:
         consecutive_empty_bins = 0
 
-    if consecutive_empty_bins >= config.close_detection_gap_bins:  // default: 5
+    if consecutive_empty_bins >= config.close_detection_gap_bins:  // default: 10
         detected_close_time = current_bin_start - (close_detection_gap_bins * bin_size)
         break  // day is complete
 ```

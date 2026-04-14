@@ -6,7 +6,7 @@
 //!
 //! Source: docs/design/03_DATA_FLOW.md §3 (enum types)
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::error::{ProcessorError, Result};
 
 /// Trade direction determined by midpoint signing.
@@ -86,7 +86,7 @@ pub struct ClassifiedTrade {
 /// Signing method for trade direction determination.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [classification]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[derive(Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningMethod {
@@ -103,7 +103,7 @@ pub enum SigningMethod {
 /// All thresholds are configurable for experiment variation.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md §5
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ClassificationConfig {
     /// Algorithm for determining trade direction.

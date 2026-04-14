@@ -62,6 +62,25 @@ pub struct DayPipeline {
     bucket_volume_override: Option<u64>,
     consecutive_empty_bins: u32,
     detected_close_ns: Option<u64>,
+    // Phase 9.4: provenance
+    /// SHA-256 of canonical TOML of `ProcessorConfig`. Set once at startup via
+    /// `set_config_hash`; preserved across `reset()` (same config across all days).
+    config_hash: Option<String>,
+    /// Basename of the input .dbn.zst for the current day (F1). Set per-day
+    /// via `set_source_file`; cleared by `reset()`.
+    source_file: Option<String>,
+    /// Phase 9.5: normalization strategy string to emit in metadata. Set
+    /// once via `set_normalization_strategy`; preserved across `reset()`.
+    /// `None` → builder default ("none") is used.
+    normalization_strategy: Option<String>,
+    /// Phase 9.4: whether Rust-side normalization was actually applied to the
+    /// NPY. Set once via `set_normalization_applied`; preserved across
+    /// `reset()`. Paired with `normalization_strategy` — both come from the
+    /// same CLI config (`apply_norm = config.export.normalization != "none"`).
+    normalization_applied: Option<bool>,
+    /// Phase 9.4 / D13: experiment identifier (from `DatasetExportConfig.experiment`).
+    /// Set once at startup; preserved across `reset()`.
+    experiment: Option<String>,
 }
 
 impl DayPipeline {
@@ -94,7 +113,61 @@ impl DayPipeline {
             bucket_volume_override: None,
             consecutive_empty_bins: 0,
             detected_close_ns: None,
+            config_hash: None,
+            source_file: None,
+            normalization_strategy: None,
+            normalization_applied: None,
+            experiment: None,
         })
+    }
+
+    /// Set the canonical config hash for metadata provenance (Phase 9.4).
+    ///
+    /// Call once immediately after `DayPipeline::new()` with the result of
+    /// `ProcessorConfig::config_hash_hex()`. The hash is preserved across
+    /// `reset()` — two consecutive days processed by the same pipeline
+    /// instance emit identical `provenance.config_hash` in their metadata.
+    pub fn set_config_hash(&mut self, hash: String) {
+        self.config_hash = Some(hash);
+    }
+
+    /// Set the input-file basename for metadata provenance (F1).
+    ///
+    /// Call **before** `stream_file()` each day. Cleared by `reset()` so
+    /// per-day state does not leak across days. Pass the basename (not the
+    /// full path) — absolute paths embed user-specific filesystem layout and
+    /// make metadata non-portable across machines.
+    pub fn set_source_file(&mut self, basename: String) {
+        self.source_file = Some(basename);
+    }
+
+    /// Set the normalization strategy string emitted in metadata (Phase 9.5).
+    ///
+    /// Valid values: `"none"` (default) or `"per_day_zscore"`. Preserved
+    /// across `reset()` since the strategy is constant for a whole run.
+    /// If not called, metadata emits `"none"` (the current production default).
+    pub fn set_normalization_strategy(&mut self, strategy: String) {
+        self.normalization_strategy = Some(strategy);
+    }
+
+    /// Set the `normalization.applied` boolean emitted in metadata (Phase 9.4).
+    ///
+    /// `true` if Rust-side normalization was actually applied to the sequences
+    /// before writing NPY; `false` if raw f64 values were exported. Pairs
+    /// with `set_normalization_strategy` — both are constant per run and
+    /// preserved across `reset()`. Under T15 "Raw Rust, Variable Python",
+    /// production configs set this to `false`.
+    pub fn set_normalization_applied(&mut self, applied: bool) {
+        self.normalization_applied = Some(applied);
+    }
+
+    /// Set the experiment identifier emitted in metadata (Phase 9.4 / D13).
+    ///
+    /// Typically comes from `DatasetExportConfig::experiment`. Makes each
+    /// metadata.json self-identifying (no directory-path dependence). Set
+    /// once at startup; preserved across `reset()`.
+    pub fn set_experiment(&mut self, experiment: String) {
+        self.experiment = Some(experiment);
     }
 
     /// Phase 1: Initialize for a new day.
@@ -123,12 +196,31 @@ impl DayPipeline {
         day: u32,
         context: Option<crate::context::DailyContext>,
     ) {
-        // Compute VPIN override from daily context BEFORE init_day
+        // Compute VPIN override from daily context BEFORE init_day.
+        //
+        // H10 fix (Round 8 validation): previously, `bucket_volume_override`
+        // was set here but the accumulator was NOT rebuilt until the next
+        // `reset()` — meaning day N's VPIN computation used day (N-1)'s
+        // consolidated volume (or the static default on day 0). Under
+        // `vpin = false` (current production configs) this was dead code,
+        // but would silently produce wrong VPIN values the moment anyone
+        // enabled the feature group. The fix: rebuild the accumulator with
+        // the new bucket volume NOW, so the current day's VPIN uses the
+        // current day's volume.
         if let (Some(ref ctx), Some(frac)) = (&context, self.config.vpin.bucket_volume_fraction) {
             if let Some(vol) = ctx.consolidated_volume {
                 let dynamic_bucket = (vol as f64 * frac) as u64;
                 if dynamic_bucket > 0 {
                     self.bucket_volume_override = Some(dynamic_bucket);
+                    // Rebuild accumulator with the dynamic bucket volume so
+                    // the CURRENT day (not the next one) uses it.
+                    let mut vpin_config = self.config.vpin.clone();
+                    vpin_config.bucket_volume = dynamic_bucket;
+                    self.accumulator = BinAccumulator::new(
+                        &self.config.validation,
+                        &vpin_config,
+                        &self.config.features,
+                    );
                 }
             }
         }
@@ -262,9 +354,29 @@ impl DayPipeline {
             }
         }
 
-        // Flush last partial bin (FIX #13)
+        // Flush last partial bin (FIX #13; Phase 9.2 / H2 extended to BBO-only)
+        //
+        // H2 fix rationale (F4):
+        //   Original condition `has_trades()` dropped the final partial bin when
+        //   the last ~30s of a session had only BBO updates and zero trades — a
+        //   common pattern near the close. The BBO-only bin's features are
+        //   valid (forward-filled flow, live BBO dynamics, context gates). We
+        //   emit it here.
+        //
+        //   Safety: a BBO-only final bin has ALL labels = NaN (no `t+h` bins
+        //   exist beyond it — see `src/labeling/point_return.rs:93`). The
+        //   sequence builder below (in `finalize()`) filters such bins via
+        //   the `valid_mask[ending_idx]` check — so the new bin is added to
+        //   `feature_bins` / `mid_prices` / `n_bins_total` but does NOT
+        //   inflate `n_sequences`.
+        //   See tests at `src/labeling/point_return.rs::test_label_single_bin`
+        //   and `::test_valid_mask_excludes_nan` for the invariant.
+        //
+        //   On half-days (auto-detect-close), `break` exits the record loop
+        //   AFTER `reset_bin()` — so at this point the accumulator is empty
+        //   (`false || false == false`) and this block is safely skipped.
         self.accumulator.prepare_for_extraction(self.sampler.market_close_ns());
-        if self.accumulator.has_trades() {
+        if self.accumulator.has_trades() || self.accumulator.bbo_update_count() > 0 {
             let final_boundary = BinBoundary {
                 bin_end_ts: self.sampler.market_close_ns(),
                 bin_midpoint_ts: self.sampler.market_close_ns()
@@ -370,7 +482,16 @@ impl DayPipeline {
         let summary = self.accumulator.day_summary();
         let norm_json = self.normalizer.to_json(&self.day_str)?;
 
-        let metadata = ExportMetadata::builder()
+        // F2 (Phase 9.4) — serialize the active config structs into metadata so
+        // the export carries both the `config_hash` (identity) and the actual
+        // values (forensic inspection). Requires 9.3 Serialize derives on
+        // `FeatureConfig` and `ClassificationConfig`.
+        let features_json = serde_json::to_value(&self.config.features)
+            .map_err(|e| ProcessorError::export(format!("serialize features config: {e}")))?;
+        let classification_json = serde_json::to_value(&self.config.classification)
+            .map_err(|e| ProcessorError::export(format!("serialize classification config: {e}")))?;
+
+        let mut builder = ExportMetadata::builder()
             .day(&self.day_str)
             .n_sequences(sequences.len())
             .window_size(window_size)
@@ -414,7 +535,41 @@ impl DayPipeline {
                     None
                 }
             )
-            .build()?;
+            // F2 — populate previously-empty `feature_groups_enabled` and
+            //      `classification_config` with the active config snapshot.
+            .feature_groups_enabled(features_json)
+            .classification_config(classification_json)
+            // Phase 9.1 — forward_prices metadata block. Unlocks T9 LabelFactory
+            // for BASIC-only training. `smoothing_window_offset = 0` is hardcoded
+            // in the builder (basic-quote-processor does NOT smooth forward prices).
+            .forward_prices(max_horizon);
+
+        // Phase 9.4 provenance — conditional setters. `config_hash` is set once
+        // at startup (preserved across `reset()`), `source_file` is set per-day
+        // (cleared by `reset()`). Unset → Option::None → metadata omits the
+        // field via `#[serde(skip_serializing_if = "Option::is_none")]`.
+        if let Some(hash) = self.config_hash.as_deref() {
+            builder = builder.config_hash(hash);
+        }
+        if let Some(src) = self.source_file.as_deref() {
+            builder = builder.provenance_source_file(src);
+        }
+        // Phase 9.5 — emit the configured strategy, not the hardcoded
+        // "per_day_zscore". If unset, metadata defaults to "none".
+        if let Some(strategy) = self.normalization_strategy.as_deref() {
+            builder = builder.normalization_strategy(strategy);
+        }
+        // Phase 9.4 — honest `applied` field. Defaults to `false` in builder
+        // if never set (matches pre-Phase-9 behavior).
+        if let Some(applied) = self.normalization_applied {
+            builder = builder.normalization_applied(applied);
+        }
+        // Phase 9.4 / D13 — experiment identifier (absent in pre-Phase-9 metadata)
+        if let Some(exp) = self.experiment.as_deref() {
+            builder = builder.experiment(exp);
+        }
+
+        let metadata = builder.build()?;
 
         Ok(DayExport {
             day: self.day_str.clone(),
@@ -477,6 +632,10 @@ impl DayPipeline {
         self.consecutive_empty_bins = 0;
         self.detected_close_ns = None;
         self.bucket_volume_override = None;
+        // Phase 9.4: source_file is per-day (clear); config_hash /
+        // normalization_strategy / normalization_applied / experiment are
+        // per-run (preserve — constant across all days in a single run).
+        self.source_file = None;
     }
 
     /// Day-level diagnostic summary.
@@ -832,5 +991,286 @@ mod tests {
                 seq_i, expected, label_row[0]
             );
         }
+    }
+
+    // ── Phase 9.4: provenance setter + finalize wiring tests ───────────
+
+    #[test]
+    fn test_pipeline_set_config_hash_preserved_across_reset() {
+        // Phase 9.4 — `config_hash` is set once at startup and preserved across
+        // `reset()` because the config does not change across days in a single run.
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.set_config_hash("deadbeef".to_string());
+        assert_eq!(pipeline.config_hash.as_deref(), Some("deadbeef"));
+        pipeline.reset();
+        assert_eq!(
+            pipeline.config_hash.as_deref(),
+            Some("deadbeef"),
+            "config_hash must be preserved across reset() (same config all days)"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_set_source_file_cleared_on_reset() {
+        // F1 — `source_file` changes per day and must be cleared by `reset()` so
+        // the next day's metadata does not leak the previous day's filename.
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.set_source_file("2025-02-03.dbn.zst".to_string());
+        assert_eq!(pipeline.source_file.as_deref(), Some("2025-02-03.dbn.zst"));
+        pipeline.reset();
+        assert_eq!(
+            pipeline.source_file, None,
+            "source_file must be cleared by reset() (per-day state)"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_finalize_emits_provenance_fields() {
+        // F1, F2, 9.4 — when setters are called, `finalize()` emits those fields
+        // in the metadata. Also verifies F2 populates the previously-empty
+        // `feature_groups_enabled` and `classification_config` objects.
+        let mut config = test_config();
+        config.labeling.horizons = vec![1, 2];
+        config.sequence = SequenceConfig { window_size: 3, stride: 1 };
+        config.validation.warmup_bins = 0;
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.init_day(2025, 2, 3);
+        let fake_hash: String = "c".repeat(64);
+        pipeline.set_config_hash(fake_hash.clone());
+        pipeline.set_source_file("xnas-basic-20250203.cmbp-1.dbn.zst".to_string());
+
+        let bins: Vec<FeatureVec> = (0..6).map(|i| make_fv(i as f64)).collect();
+        let mid_prices: Vec<f64> = (0..6).map(|i| 100.0 + i as f64).collect();
+        pipeline.set_test_data(bins, mid_prices);
+
+        let export = pipeline.finalize().unwrap();
+
+        // 9.4 — config_hash threaded through
+        assert_eq!(
+            export.metadata.provenance.config_hash.as_ref(),
+            Some(&fake_hash),
+            "config_hash must appear in metadata.provenance"
+        );
+        // F1 — source_file threaded through (basename, not empty string)
+        assert_eq!(
+            export.metadata.provenance.source_file,
+            "xnas-basic-20250203.cmbp-1.dbn.zst",
+            "source_file must be threaded through finalize"
+        );
+        // F2 — populated (no longer empty `{}`)
+        assert_ne!(
+            export.metadata.feature_groups_enabled,
+            serde_json::json!({}),
+            "feature_groups_enabled must be populated (F2)"
+        );
+        assert_ne!(
+            export.metadata.classification_config,
+            serde_json::json!({}),
+            "classification_config must be populated (F2)"
+        );
+        // F2 — feature_groups_enabled must contain the actual field structure
+        assert!(
+            export.metadata.feature_groups_enabled
+                .get("signed_flow").is_some(),
+            "feature_groups_enabled must reflect FeatureConfig fields"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_set_normalization_strategy_threads_through_finalize() {
+        // Round 7 (Agent 4 recommendation): catches the bug where
+        // `set_normalization_strategy` and `set_normalization_applied` are
+        // silently disconnected from the builder chain in finalize().
+        let mut config = test_config();
+        config.labeling.horizons = vec![1];
+        config.sequence = SequenceConfig { window_size: 3, stride: 1 };
+        config.validation.warmup_bins = 0;
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.init_day(2025, 2, 3);
+        pipeline.set_normalization_strategy("per_day_zscore".to_string());
+        pipeline.set_normalization_applied(true);
+
+        let bins: Vec<FeatureVec> = (0..5).map(|i| make_fv(i as f64)).collect();
+        let mid_prices: Vec<f64> = (0..5).map(|i| 100.0 + i as f64).collect();
+        pipeline.set_test_data(bins, mid_prices);
+
+        let export = pipeline.finalize().unwrap();
+
+        assert_eq!(
+            export.metadata.normalization.strategy, "per_day_zscore",
+            "Strategy must be threaded from setter to metadata"
+        );
+        assert!(
+            export.metadata.normalization.applied,
+            "Applied must be threaded from setter to metadata"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_set_experiment_preserved_across_reset() {
+        // Round 7 / D13: experiment identifier is per-run state (constant
+        // across days). Must survive reset() for the same reason config_hash does.
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.set_experiment("basic_nvda_60s_phase9".to_string());
+        assert_eq!(pipeline.experiment.as_deref(), Some("basic_nvda_60s_phase9"));
+        pipeline.reset();
+        assert_eq!(
+            pipeline.experiment.as_deref(),
+            Some("basic_nvda_60s_phase9"),
+            "experiment must be preserved across reset (per-run state)"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_set_normalization_applied_preserved_across_reset() {
+        // Round 7: normalization_applied is per-run state (same across all days).
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.set_normalization_applied(true);
+        assert_eq!(pipeline.normalization_applied, Some(true));
+        pipeline.reset();
+        assert_eq!(
+            pipeline.normalization_applied,
+            Some(true),
+            "normalization_applied must be preserved across reset (per-run state)"
+        );
+    }
+
+    #[test]
+    fn test_h10_bucket_volume_override_set_during_init_with_context() {
+        // Round 8 / H10 regression: bucket_volume_override must be SET during
+        // `init_day_with_context` (not deferred to the next reset()). Before
+        // the fix, day N used day (N-1)'s volume for VPIN bucket sizing;
+        // day 0 used the static default. After the fix, day N uses day N's
+        // volume IMMEDIATELY. This test asserts the override FIELD is set
+        // correctly — the accumulator rebuild is tested indirectly by the
+        // non-panic of this call path with vpin_config cloned from the
+        // dynamic bucket.
+        use chrono::NaiveDate;
+        let mut config = test_config();
+        config.features.vpin = true;
+        config.vpin.bucket_volume_fraction = Some(0.02); // 2% of daily vol
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        let context = crate::context::DailyContext {
+            date: NaiveDate::from_ymd_opt(2025, 2, 3).unwrap(),
+            consolidated_volume: Some(100_000_000), // 100M shares
+            daily_open: None,
+            daily_high: None,
+            daily_low: None,
+            daily_close: None,
+        };
+        pipeline.init_day_with_context(2025, 2, 3, Some(context));
+
+        // Override = 100_000_000 * 0.02 = 2_000_000
+        assert_eq!(
+            pipeline.bucket_volume_override,
+            Some(2_000_000),
+            "bucket_volume_override = consolidated_volume * fraction"
+        );
+        // Also verify daily_context is stored
+        assert!(pipeline.daily_context.is_some());
+        assert_eq!(
+            pipeline.daily_context.as_ref().unwrap().consolidated_volume,
+            Some(100_000_000)
+        );
+    }
+
+    #[test]
+    fn test_h10_no_override_when_context_missing() {
+        // If daily context lacks consolidated_volume, override stays None
+        // and accumulator uses the static default bucket_volume.
+        let mut config = test_config();
+        config.features.vpin = true;
+        config.vpin.bucket_volume_fraction = Some(0.02);
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        let context = crate::context::DailyContext::fallback(
+            chrono::NaiveDate::from_ymd_opt(2025, 2, 3).unwrap(),
+        );
+        pipeline.init_day_with_context(2025, 2, 3, Some(context));
+        assert_eq!(pipeline.bucket_volume_override, None);
+    }
+
+    #[test]
+    fn test_h10_no_override_when_fraction_unset() {
+        // If config has no bucket_volume_fraction, the EQUS context is not
+        // consulted for override — static bucket_volume is used.
+        let mut config = test_config();
+        config.features.vpin = true;
+        // bucket_volume_fraction left at default (None)
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        let context = crate::context::DailyContext {
+            date: chrono::NaiveDate::from_ymd_opt(2025, 2, 3).unwrap(),
+            consolidated_volume: Some(100_000_000),
+            daily_open: None,
+            daily_high: None,
+            daily_low: None,
+            daily_close: None,
+        };
+        pipeline.init_day_with_context(2025, 2, 3, Some(context));
+        assert_eq!(
+            pipeline.bucket_volume_override, None,
+            "No fraction configured → no override computed"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_finalize_emits_experiment_when_set() {
+        // Round 7 / D13: when set_experiment is called, metadata.experiment is emitted.
+        let mut config = test_config();
+        config.labeling.horizons = vec![1];
+        config.sequence = SequenceConfig { window_size: 3, stride: 1 };
+        config.validation.warmup_bins = 0;
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.init_day(2025, 2, 3);
+        pipeline.set_experiment("basic_nvda_60s_phase9".to_string());
+
+        let bins: Vec<FeatureVec> = (0..5).map(|i| make_fv(i as f64)).collect();
+        let mid_prices: Vec<f64> = (0..5).map(|i| 100.0 + i as f64).collect();
+        pipeline.set_test_data(bins, mid_prices);
+
+        let export = pipeline.finalize().unwrap();
+        assert_eq!(
+            export.metadata.experiment.as_deref(),
+            Some("basic_nvda_60s_phase9"),
+            "experiment field must be threaded into metadata"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_finalize_without_provenance_setters_omits_fields() {
+        // Backward compat: if `set_config_hash` / `set_source_file` are never
+        // called, the metadata's `config_hash` is None (skipped on serialize)
+        // and `source_file` is "" (existing default behavior).
+        let mut config = test_config();
+        config.labeling.horizons = vec![1];
+        config.sequence = SequenceConfig { window_size: 3, stride: 1 };
+        config.validation.warmup_bins = 0;
+
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        pipeline.init_day(2025, 2, 3);
+
+        let bins: Vec<FeatureVec> = (0..5).map(|i| make_fv(i as f64)).collect();
+        let mid_prices: Vec<f64> = (0..5).map(|i| 100.0 + i as f64).collect();
+        pipeline.set_test_data(bins, mid_prices);
+
+        let export = pipeline.finalize().unwrap();
+
+        assert!(
+            export.metadata.provenance.config_hash.is_none(),
+            "Unset config_hash must remain None in metadata"
+        );
+        assert_eq!(
+            export.metadata.provenance.source_file, "",
+            "Unset source_file defaults to empty string (preserves v0 behavior)"
+        );
     }
 }

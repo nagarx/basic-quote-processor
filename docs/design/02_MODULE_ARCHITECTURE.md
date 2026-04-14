@@ -273,7 +273,7 @@ Bins with zero TRF trades are a real occurrence. At 60s bins during regular hour
 NYSE early-close days (~3/year: July 3, day after Thanksgiving, Christmas Eve) close at 13:00 ET instead of 16:00 ET.
 
 **Approach**: Data-driven detection, not hardcoded calendar.
-- If no records arrive for N consecutive bins (configurable, default 5), treat day as complete
+- If no records arrive for N consecutive bins (configurable, default 10), treat day as complete
 - Session progress feature adjusted to reflect actual trading duration (1.0 at detected close, not at 16:00)
 
 **Rationale**: A hardcoded holiday calendar is fragile (exchange schedule changes, unscheduled closures). Data-driven detection is robust to any closure pattern and requires zero maintenance.
@@ -396,26 +396,19 @@ Whether minor lit venues (XBOS, XPSX) are counted as lit is configurable via `[p
 
 ### 4.4 features/ -- Feature Computation
 
-**Responsibility**: Compute all off-exchange features from accumulated bin data.
+**Responsibility**: Compute all 34 off-exchange features from accumulated bin data.
 
-**Files**:
+**Files** (2):
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `FeatureExtractor` orchestrator. Calls each enabled feature group, assembles `Vec<f64>` |
-| `config.rs` | `FeatureConfig` -- which groups are enabled. Derived from `[features]` section of TOML |
-| `signed_flow.rs` | `trf_signed_imbalance` (net signed volume / total volume), `mroib` (retail OIB), `inv_inst_direction` (inverse institutional), `bvc_imbalance` |
-| `venue_metrics.rs` | `dark_share` (TRF volume / total volume), `trf_volume`, `lit_volume`, `total_volume` |
-| `retail_metrics.rs` | `subpenny_intensity` (subpenny trades / total trades), `odd_lot_ratio`, `retail_trade_rate`, `retail_volume_fraction` |
-| `vpin.rs` | Volume-synchronized VPIN (Easley et al. 2012). Uses volume bars (not time bars) with BVC for trade signing. Separate VPIN for TRF and lit venues |
-| `kyle_lambda.rs` | Rolling Kyle's lambda estimate. Delegates to `KyleLambda` from `hft-statistics`. Measures price impact per unit volume |
-| `bbo_dynamics.rs` | L1 spread dynamics from quote updates: `spread_bps`, `bid_pressure` (bid size change rate), `ask_pressure`, `bbo_update_rate`, `quote_imbalance` (bid_size - ask_size normalized), `spread_change_rate` |
-| `trade_size.rs` | `mean_trade_size`, `block_trade_ratio` (trades > threshold / total), `trade_count`, `size_concentration` (Herfindahl on size buckets) |
-| `cross_venue.rs` | `trf_burst_intensity` (clustered TRF prints within short window), `time_since_burst`, `trf_lit_volume_ratio` |
-| `experimental.rs` | Placeholder for future features. Behind `#[cfg(feature = "experimental")]` gate |
+| `mod.rs` | `FeatureExtractor` orchestrator. Delegates to inline helper functions per feature group (NOT separate sub-files). Consumes `BinAccumulator` + `BboState` + `DailyContext`, produces the 34-element `Vec<f64>` in one pass. Empty-bin forward-fill logic lives here. |
+| `indices.rs` | Named constants for all 34 feature indices (`TRF_SIGNED_IMBALANCE = 0`, `SUBPENNY_INTENSITY = 8`, etc.) + per-group `Range` constants (`SIGNED_FLOW_RANGE`, `VPIN_RANGE`, etc.). Consumed by `FeatureConfig::enabled_feature_count()` and the contract module. |
 
-**Input**: `BinAccumulator` (accumulated state for current bin) + `DailyContext` (consolidated volume from EQUS_SUMMARY)
-**Output**: `Arc<Vec<f64>>` -- feature vector for one time bin. Zero-copy shared between sequence builder and label computer.
+Feature groups are organized as contiguous index ranges (§4.4 below) rather than separate files. `FeatureConfig` (`src/config.rs`) toggles which groups are computed; disabled groups produce zeros at their indices but still occupy feature-vector space.
+
+**Input**: `BinAccumulator` (accumulated state for current bin) + `BboState` + `DailyContext` (consolidated volume from EQUS_SUMMARY)
+**Output**: `Vec<f64>` (34 elements) — populated in-place via a mutable `&mut Vec<f64>` buffer to avoid per-bin allocation. Wrapped in `Arc<Vec<f64>>` by `DayPipeline::emit_bin` for zero-copy sharing with the sequence builder and label computer.
 **State**: Stateless per extraction call. All state lives in the accumulator.
 **Reset**: N/A -- stateless
 
@@ -442,13 +435,14 @@ These indices are independent of the MBO pipeline's 0-147 feature space. The dow
 
 **Responsibility**: Determine bin boundaries and signal when a bin is complete.
 
-**Files**:
+**Files** (2):
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `Sampler` trait with `is_bin_complete(timestamp) -> bool` and `current_bin_id() -> u64`. `TimeBinSampler` as primary implementation |
-| `time_bin.rs` | `TimeBinSampler`: fixed-interval time bins grid-aligned to market open (09:30 ET). Configurable bin size (10s, 30s, 60s, 120s). Uses `hft_statistics::time::regime::{utc_offset_for_date, day_epoch_ns}` for EST/EDT handling |
-| `volume_bin.rs` | `VolumeBinSampler`: dollar-volume bins for VPIN computation (Easley 2012). Bucket volume = daily volume * `bucket_volume_fraction`. Separate from the main time-bin sampling |
+| `mod.rs` | Module entry. Re-exports `TimeBinSampler` + `BinBoundary`. No trait abstraction today — `DayPipeline` hardwires `TimeBinSampler` as the sole implementation (see "Validated Design Items" in `CODEBASE.md` for the deferred `Sampler` trait). |
+| `time_bin_sampler.rs` | `TimeBinSampler`: fixed-interval time bins grid-aligned to market open (09:30 ET). Configurable bin size (5s, 10s, 15s, 30s, 60s, 120s, 300s, 600s). Uses `hft_statistics::time::regime::{utc_offset_for_date, day_epoch_ns}` for exact EST/EDT handling. |
+
+Volume-based sampling (VPIN computation) lives inside `accumulator/` (bucket-volume tracking) rather than as a separate sampler — VPIN runs in parallel with the time-bin sampling, not as an alternative to it.
 
 **Input**: Timestamp (u64 nanoseconds UTC) for time bins; cumulative volume for volume bins
 **Output**: Boolean indicating bin boundary crossed; bin identifier
@@ -461,14 +455,16 @@ These indices are independent of the MBO pipeline's 0-147 feature space. The dow
 
 **Responsibility**: Aggregate classified trades and BBO updates within a single time bin.
 
-**Files**:
+**Files** (6):
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `BinAccumulator` orchestrator. Dispatches to sub-accumulators. Provides `accumulate(trade, bbo)` and `reset()` methods |
-| `flow_accumulator.rs` | Accumulates signed volumes: buy_volume, sell_volume, unsigned_volume, retail_buy_volume, retail_sell_volume, trf_volume, lit_volume. All as f64 shares |
-| `count_accumulator.rs` | Accumulates trade counts: total_trades, trf_trades, lit_trades, retail_trades, subpenny_trades, odd_lot_trades, block_trades. All as u64 |
-| `stats_accumulator.rs` | Running statistics per bin using `WelfordAccumulator` from `hft-statistics`: trade size mean/variance, spread mean/variance, BBO update count |
+| `mod.rs` | `BinAccumulator` orchestrator. Dispatches to sub-accumulators. Provides `accumulate(trade)`, `accumulate_bbo_update(bbo, ts)`, `prepare_for_extraction(bin_end_ts)`, `reset_bin()` methods. Carries the VPIN bucket-volume tracker (volume-bar BVC) alongside the time-bin logic. |
+| `flow_accumulator.rs` | Accumulates signed volumes: buy_volume, sell_volume, unsigned_volume, retail_buy_volume, retail_sell_volume, trf_volume, lit_volume. All as f64 shares. |
+| `count_accumulator.rs` | Accumulates trade counts: total_trades, trf_trades, lit_trades, retail_trades, subpenny_trades, odd_lot_trades, block_trades. All as u64. |
+| `stats_accumulator.rs` | Running statistics per bin using `Welford` from `hft-statistics`: trade-size mean/variance, BBO-update TWAP (time-weighted average spread), update count, start/last-spread snapshots. |
+| `burst_tracker.rs` | Tracks TRF "burst" events — consecutive TRF prints within a short window, used by `trf_burst_intensity` and `time_since_burst` features (cross-venue group). |
+| `forward_fill.rs` | Per-bin forward-fill state (Level 2 empty-bin policy): when a bin has no TRF trades, the feature extractor carries forward the previous bin's flow-derived values so downstream models see continuous series rather than spurious zeros. |
 
 **Input**: `ClassifiedTrade` + current `BboState`
 **Output**: Accumulated state (queried by `FeatureExtractor` at bin boundary)
@@ -479,14 +475,13 @@ These indices are independent of the MBO pipeline's 0-147 feature space. The dow
 
 ### 4.7 sequence_builder/ -- Sequence Construction for ML
 
-**Responsibility**: Construct fixed-length sequences from a sliding window of feature vectors.
+**Responsibility**: Define the `FeatureVec` type alias and provide sliding-window sequence construction helpers.
 
-**Files**:
+**Files** (1):
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `SequenceBuilder`: maintains a ring buffer of `window_size` feature vectors. `push(feature_vec)` adds a new vector; `try_build_sequence()` returns `Some([T, F])` if the buffer is full |
-| `window.rs` | Sliding window implementation with configurable stride. Ring buffer of `Arc<Vec<f64>>` (zero-copy from feature extractor) |
+| `mod.rs` | Defines `pub type FeatureVec = Arc<Vec<f64>>` (zero-copy 34-element feature vector shared between the producer and all consumers). Sliding-window sequence assembly lives inline in `pipeline.rs::finalize()` (`feature_bins[seq_start..=ending_idx]`) rather than as a standalone type — the window is consumed once per day, not streamed, so a reusable `SequenceBuilder` struct would be premature abstraction. |
 
 **Input**: `Arc<Vec<f64>>` feature vectors, one per bin
 **Output**: Sequences of shape `[T, F]` where T = `window_size` (configurable, default 20) and F = number of enabled features
@@ -516,16 +511,17 @@ These indices are independent of the MBO pipeline's 0-147 feature space. The dow
 
 ### 4.9 export/ -- NPY/JSON Export
 
-**Responsibility**: Write sequences, labels, and metadata to disk in the pipeline's standard export format.
+**Responsibility**: Write sequences, labels, forward prices, metadata, manifest, and normalization stats to disk in the pipeline's standard export format.
 
-**Files**:
+**Files** (5):
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `Exporter` orchestrator. Manages output directory structure, calls sub-exporters |
-| `npy_export.rs` | Writes NPY files using `ndarray-npy`. Handles f32 downcast for sequences (with `is_finite()` guard) and f64 for labels/forward prices |
-| `metadata.rs` | Writes `{day}_metadata.json` with: schema_version, n_sequences, n_features, window_size, bin_size_seconds, feature_groups_enabled, label_horizons, market_open_et, date, export_timestamp, provenance |
-| `normalization.rs` | Computes and writes `{day}_normalization.json` with per-feature mean and std (excluding categorical features at indices 29-30, 32-33) |
+| `mod.rs` | `DayExporter` orchestrator + `DayExport` struct. Wires the per-day assembly (sequences + labels + forward_prices + metadata + normalization) and delegates file writes to the sub-modules. |
+| `metadata.rs` | `ExportMetadata` struct + `ExportMetadataBuilder`. Writes `{day}_metadata.json` with all spec-required fields including `provenance.config_hash`, `provenance.source_file`, `forward_prices` (6-field block), `normalization` (honest strategy), `feature_groups_enabled` (active `FeatureConfig` snapshot), `classification_config`. |
+| `normalization.rs` | `NormalizationComputer` using `Welford` (from `hft-statistics`) for per-feature mean/std across all post-warmup bins. Excludes categorical indices (29, 30, 32, 33). Writes `{day}_normalization.json` with finalized statistics. |
+| `npy_writer.rs` | Writes NPY files via `ndarray-npy`. Handles f32 downcast for sequences (with `is_finite()` guard) and f64 for labels + forward prices. Emits three files per day: `{day}_sequences.npy`, `{day}_labels.npy`, `{day}_forward_prices.npy`. |
+| `manifest.rs` | `DatasetManifest` — the top-level `dataset_manifest.json` written to the export root. Tracks all processed days across train/val/test splits, aggregate statistics, and per-day status (success/failure with error message). |
 
 **Input**: Sequences `[N, T, F]`, labels `[N, H]`, forward prices `[N, max_H+1]`, metadata struct
 **Output**: Files on disk in the export directory

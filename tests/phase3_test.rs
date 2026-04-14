@@ -127,9 +127,9 @@ fn process_day(
         }
     }
 
-    // Flush last partial bin (FIX #11)
+    // Flush last partial bin (FIX #11; Phase 9.2 / H2 extended to BBO-only)
     accumulator.prepare_for_extraction(sampler.market_close_ns());
-    if accumulator.has_trades() {
+    if accumulator.has_trades() || accumulator.bbo_update_count() > 0 {
         let final_boundary = BinBoundary {
             bin_end_ts: sampler.market_close_ns(),
             bin_midpoint_ts: sampler.market_close_ns() - sampler.bin_size_ns() / 2,

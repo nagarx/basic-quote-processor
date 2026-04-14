@@ -156,8 +156,17 @@ impl DatasetManifest {
     }
 
     /// Mark the manifest as complete.
+    ///
+    /// Round 8 (Agent E4 fix): `complete` is now `true` ONLY if all days
+    /// succeeded. A partial run (some `failed_days` recorded) sets
+    /// `complete = false` so downstream consumers checking
+    /// `manifest.complete` can trust it as a success indicator. The
+    /// per-split `failed_days` list still holds the detail.
     pub fn mark_complete(&mut self) {
-        self.complete = true;
+        let n_failed = self.splits.train.failed_days.len()
+            + self.splits.val.failed_days.len()
+            + self.splits.test.failed_days.len();
+        self.complete = n_failed == 0;
         self.update_totals();
         self.export_timestamp = chrono::Utc::now().to_rfc3339();
     }
@@ -255,6 +264,65 @@ mod tests {
         assert!(manifest.complete);
         assert_eq!(manifest.days_processed, 3);
         assert_eq!(manifest.total_sequences, 180);
+    }
+
+    #[test]
+    fn test_manifest_mark_complete_false_when_failures_exist() {
+        // Round 8 / Agent E4 fix: if any day failed, `complete` must be
+        // false. Previously mark_complete() set true unconditionally,
+        // which lied to downstream consumers checking manifest.complete.
+        let mut manifest = test_manifest();
+        manifest.splits.train.record_day("2025-02-03", 100);
+        manifest.splits.train.record_failure("2025-02-04", "decode error");
+        manifest.mark_complete();
+        assert!(
+            !manifest.complete,
+            "complete must be false when any day failed"
+        );
+    }
+
+    #[test]
+    fn test_manifest_mark_complete_true_when_no_failures() {
+        // Positive case: mark_complete → true when zero failures.
+        let mut manifest = test_manifest();
+        manifest.splits.train.record_day("2025-02-03", 100);
+        manifest.splits.val.record_day("2025-10-01", 50);
+        manifest.mark_complete();
+        assert!(manifest.complete, "complete must be true when all days succeeded");
+    }
+
+    #[test]
+    fn test_manifest_mark_complete_false_on_val_or_test_failure() {
+        // Failures in ANY split (not just train) must trip complete=false.
+        let mut manifest = test_manifest();
+        manifest.splits.test.record_failure("2025-11-14", "out of memory");
+        manifest.mark_complete();
+        assert!(!manifest.complete);
+    }
+
+    #[test]
+    fn test_manifest_set_config_hash_propagates_to_json() {
+        // Round 7 (Agent 3 gap #6): CLI computes config_hash and threads it
+        // into the manifest via `set_config_hash`. Test ensures the string
+        // propagates through serialization to the user-visible JSON.
+        let mut manifest = test_manifest();
+        let fake_hash: String = "c".repeat(64);
+        manifest.set_config_hash(&fake_hash);
+        assert_eq!(manifest.config_hash, fake_hash);
+        let json = manifest.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["config_hash"], fake_hash);
+    }
+
+    #[test]
+    fn test_manifest_config_hash_empty_by_default() {
+        // Round 7: if CLI forgets to call set_config_hash, manifest still
+        // serializes (with empty string — pre-existing behavior). Documents
+        // the fallback.
+        let manifest = test_manifest();
+        let json = manifest.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["config_hash"], "");
     }
 
     #[test]

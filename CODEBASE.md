@@ -2,7 +2,7 @@
 
 Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
-**Status**: Phases 1-5 complete (412 tests: 365 lib + 47 integration)
+**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (471 tests: 408 lib + 63 integration)
 **Schema**: off_exchange 1.0 (independent of MBO schema 2.2)
 **Features**: 34 (indices 0-33), 10 groups
 **Labels**: Point-return only (no smoothed), 8 horizons [1,2,3,5,10,20,30,60]
@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 412 tests
-cargo test --lib               # Run 365 lib tests only
+cargo test                     # Run all 471 tests
+cargo test --lib               # Run 408 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -213,21 +213,26 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 - `[publishers]` config section deferred — using hardcoded PublisherClass::from_id()
 - Half-day detection pre-detection bins have ~2% session_progress error (accepted AD1)
 - `equs_summary_path` optional (spec says required, code overrides for library usability — AD2)
-- VPIN bucket_volume_fraction deferred — using fixed bucket_volume=5000
+- Phase 6 (Python analysis scripts) not yet implemented — all analysis performed via `lob-dataset-analyzer` on the exported NPY files
 - Phase 6 (Python analysis scripts) not yet implemented
 - Single-feed XNAS.BASIC coverage = 61.2% (not 81-85% which requires multi-feed fusion)
 
 ### Validated Design Items (Post-Push Improvements)
 
-These were identified during a 3-agent deep audit of all 40 source files. None are bugs — they are extensibility and quality items for future commits.
+These were identified during a 3-agent deep audit of all 41 source files. None are bugs — they are extensibility and quality items for future commits.
 
 - **TRADE_COUNT (idx 22) and BIN_TRADE_COUNT (idx 27) produce identical values** — both compute `total_trades`. One is in the toggleable trade_size group, the other in the always-on activity group. Removing requires schema version bump.
 - **`finalize()` does not dispatch on `LabelStrategy` enum** — always uses `LabelComputer` (PointReturn). Latent: only one variant exists. Fix when adding second label strategy.
-- **Config structs lack `Serialize` derive** — `ProcessorConfig` has `Deserialize` but not `Serialize`. Cannot serialize active config for experiment tracking. CLI copies raw config file instead.
+- **Config structs lack `Serialize` derive** — ~~`ProcessorConfig` has `Deserialize` but not `Serialize`~~. **RESOLVED in Phase 9.3** — all 14 config structs/enums now derive `Serialize`. `ProcessorConfig::to_canonical_toml()` is the single canonical serialization path, and `ProcessorConfig::config_hash_hex()` provides a 64-char SHA-256 for provenance.
 - **`SamplingConfig.strategy` and `ValidationConfig.empty_bin_policy` are String, not enum** — validated at runtime against hardcoded lists. Should be proper Rust enums for type-level safety.
 - **No `Sampler` trait** — `TimeBinSampler` is hardwired in `pipeline.rs`. Extract trait when adding volume-based or composite sampling.
 - **BVC uses sample variance (n-1), BurstTracker uses population variance (n)** — both defensible for their contexts (BVC estimates population parameter from sample, BurstTracker is descriptive statistic of bin data).
-- **`ExportMetadata.normalization.strategy` is hardcoded to `"per_day_zscore"`** in `src/export/metadata.rs:232` regardless of the actual `[export].normalization` config value. Only the `applied: bool` field reflects whether normalization was actually applied. Trainer should rely on `applied` not `strategy` until this is fixed.
+- **`ExportMetadata.normalization.strategy` is hardcoded to `"per_day_zscore"`** — **RESOLVED in Phase 9.5** — strategy is now configurable via `ExportMetadataBuilder::normalization_strategy(&str)` and defaults to `"none"`. The CLI (`export_dataset.rs`) threads `config.export.normalization` into the builder via `DayPipeline::set_normalization_strategy(String)`.
+- **`ExportMetadata.feature_groups_enabled` and `.classification_config` emitted as empty `{}`** — **RESOLVED in Phase 9.4 / F2** — `pipeline.rs::finalize()` now serializes the active `FeatureConfig` and `ClassificationConfig` via `serde_json::to_value(&...)` and threads them into the builder, so metadata carries the actual config values alongside `config_hash`.
+- **`ExportMetadata.provenance.source_file` emitted as empty string** — **RESOLVED in Phase 9.4 / F1** — `DayPipeline::set_source_file(String)` is called by the CLI per-day with the `.dbn.zst` basename (cleared by `reset()`).
+- **No `forward_prices` metadata block** — **RESOLVED in Phase 9.1** — `ExportMetadata::forward_prices: Option<ForwardPricesMeta>` with 6 fields matching `contracts/pipeline_contract.toml [forward_prices.metadata]` and `hft-contracts.ForwardPriceContract.from_metadata()`. Unblocks T9 LabelFactory pathway for BASIC-only training.
+- **H2: final partial bin drop** — **RESOLVED in Phase 9.2** — `pipeline.rs` and `tests/phase3_test.rs` final-flush condition now `has_trades() || bbo_update_count() > 0`. BBO-only bins are emitted into `feature_bins` but filtered out of sequences via `valid_mask` (all-NaN labels since no `t+h` bins exist beyond).
+- **BUG-X2: `is_empty = trf_trades == 0` at `pipeline.rs:307` excludes lit-only bins** — DEFERRED (LOW severity, diagnostic counters only; does not affect labels/sequences).
 
 ### Test Coverage Roadmap (Future Work)
 
@@ -244,6 +249,35 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.
 10. **Integration test gating** — currently silently SKIP without data; add `CI=true` panic to prevent silent zero-coverage CI runs.
 11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback.
+12. **`git_commit` / `git_dirty` provenance via `build.rs`** — currently metadata emits `processor_version` (from `env!("CARGO_PKG_VERSION")`) but no git commit hash. Phase 10 will add a `build.rs` script that shells to `git rev-parse HEAD` at compile time and exposes via `env!("GIT_COMMIT")`.
+13. **Frozen golden-hash regression test** — assert that a fixed-config input produces a known 64-char hex hash (Phase 10, detects accidental drift from serde_derive or toml minor version bumps).
+14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+).
+15. **`validate_off_exchange_export_contract`** (Python consumer) does not yet validate the `forward_prices` block presence/shape — add in `hft-contracts` alongside Phase 10.
+
+### Phase 10+ Roadmap (surfaced by Round 8 agent validation)
+
+**Architectural (worth planning for):**
+16. **Runtime-derived `TOTAL_FEATURES`** — currently a compile-time `usize` with a fixed `[&str; 34]` `FEATURE_NAMES` array. Adding a new feature group forces a schema-breaking change. Phase 11+ should make this runtime-derived from `FeatureConfig.enabled_feature_count()` so feature additions are additive under a bumped `contract_version`.
+17. **Extract `process_record()` from `stream_file()`** — the 100-line streaming for-loop body is the streaming hot path. Factoring it out as `fn process_record(&mut self, record: &CmbpRecord) -> Option<FeatureEmission>` would preserve streaming optionality for Phase 13+ without forking 100 lines of code later.
+18. **Refactor provenance setters into a single `Provenance` struct** — the setter count on `DayPipeline` has reached 5 (`set_config_hash`, `set_source_file`, `set_normalization_strategy`, `set_normalization_applied`, `set_experiment`, `set_symbol` planned). Before adding a 6th, collapse the per-run subset (`config_hash`, `normalization_strategy`, `normalization_applied`, `experiment`) into `set_run_provenance(RunProvenance)`.
+19. **Extract `Sampler` and `Labeler` traits** — DO IT at the moment a second implementation lands (triple-barrier, volume sampling), NOT before. Accumulating two more concrete implementations before the trait makes the eventual refactor harder.
+
+**Observability (forensic / operational):**
+20. **`--skip-existing` idempotent resume** — currently `--force` re-runs ALL 233 days from scratch; a mid-run failure costs a full re-run. Read existing `dataset_manifest.json.splits.*.days[]` and skip dates already present. Saves ~12 min per config in sweep runs.
+21. **Per-day timing breakdown in metadata** — currently only wall-clock elapsed seconds in stderr. Adding `read_time_ms`, `extract_time_ms`, `write_time_ms` to `ExportMetadata` enables performance regression detection across sweep runs.
+22. **Config-drift detection on `--force`** — read existing manifest's `config_hash`, warn (or refuse without `--clean`) if it differs from the new hash. Prevents silent inconsistency when mixing partial re-runs of different configs into the same `output_dir`.
+23. **Surface silent fallbacks** — `source_basename.unwrap_or("")` and `let _ = fs::write(config_copy_path, ...)` currently swallow errors. Add `log::warn!` on empty basename or failed config copy.
+24. **Promote `Ok(0)` sequences to an explicit status** — currently `export.sequences.is_empty()` is recorded as a successful day. Consider either (a) demoting it to `record_failure` with a specific reason, or (b) adding `n_days_zero_seq` to manifest so sweep consumers can differentiate broken days from legitimately empty days.
+
+**Schema (Schema 2.0 consolidation):**
+25. **De-duplicate metadata ↔ manifest** — ~12 fields overlap with 3 naming drifts (`n_features` vs `feature_count`, `window_size` vs `sequence_length`, `label_strategy` vs `labeling_strategy`). Schema 2.0 should consolidate to a single naming convention across both files and remove redundancy (e.g., manifest keeps dataset-level facts, metadata keeps per-day facts only, manifest_ref pointer in metadata).
+26. **Remove duplicate `export_timestamp`** — metadata has both top-level `export_timestamp` and nested `provenance.export_timestamp_utc`, set to identical values. Pick one (recommend `provenance.export_timestamp_utc`).
+27. **Convert string-valued enums to Rust enums** — `schema`, `data_source`, `signing_method`, `label_encoding`, `normalization.strategy` are de-facto enums but typed as `String`. Converting to Rust enums with `#[serde(rename_all)]` gives parse-time validation.
+28. **Add `data_file_sha256` to provenance** — input file content hash enables detection of "same source_file path but different content" (databento re-issue). ~10 LOC, high forensic value. Round 8 M7.1.
+29. **Document n_bins accounting invariant** — DONE IN ROUND 8 (doc comment added). Consider adding a `debug_assert!` in `finalize()` enforcing `n_bins_total == n_bins_valid + n_bins_label_truncated` to catch regressions.
+
+**H10 VPIN fix forward-compatibility:**
+30. **VPIN integration tests** — H10 regression test (Round 8) only asserts the `bucket_volume_override` field is SET correctly. When `vpin = true` is ever enabled in a production config, add an end-to-end test that confirms the first day's VPIN bucket reflects the first day's consolidated_volume (not the default 5000 or day N−1's volume).
 
 ---
 
