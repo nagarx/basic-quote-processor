@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+.cargo/config.toml
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.env

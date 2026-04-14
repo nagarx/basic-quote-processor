@@ -1,0 +1,39 @@
+# Production config for NVDA off-exchange features (60-second bins)
+#
+# Usage: export_dataset --config configs/nvda_60s.toml
+
+[input]
+# Update these paths to your local Databento data location.
+data_dir = "./data/XNAS_BASIC/NVDA/cmbp1"
+equs_summary_path = "./data/EQUS_SUMMARY/NVDA/equs-summary.ohlcv-1d.dbn.zst"
+filename_pattern = "xnas-basic-{date}.cmbp-1.dbn.zst"
+symbol = "NVDA"
+
+[dates]
+start_date = "2025-02-03"
+end_date = "2026-01-06"
+
+[sampling]
+bin_size_seconds = 60
+
+[sequence]
+window_size = 20
+stride = 1
+
+[labeling]
+label_type = "point_return"
+horizons = [1, 2, 3, 5, 10, 20, 30, 60]
+
+[validation]
+auto_detect_close = true
+close_detection_gap_bins = 10
+
+[export]
+output_dir = "./data/exports/basic_nvda_60s"
+experiment = "basic_nvda_60s"
+normalization = "none"
+continue_on_error = true
+
+[export.split_dates]
+train_end = "2025-09-30"
+val_end = "2025-11-13"
