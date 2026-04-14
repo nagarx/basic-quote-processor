@@ -6,6 +6,28 @@
 
 ---
 
+## Implementation Status (Phase 5 Complete, 2026-04-13)
+
+This schema documents the **complete intended design**. Several sections describe deferred or planned features. Always cross-reference against `src/config.rs` and `CODEBASE.md` "Known Limitations" for the operational reference of current capabilities.
+
+| Section / Feature | Status | Notes |
+|-------------------|--------|-------|
+| `[input]` (data paths only — no dates) | **IMPLEMENTED** | `start_date`/`end_date` live in `[dates]`, not `[input]` |
+| `[dates]` (`start_date`, `end_date`, `exclude_dates`) | **IMPLEMENTED** | Required for `DatasetConfig` (CLI); not in `ProcessorConfig` (library API) |
+| `[sampling]` | **PARTIALLY IMPLEMENTED** | Only `strategy = "time_based"` is currently valid; `"volume_based"` is **PLANNED** |
+| `[classification]` | **IMPLEMENTED** | `signing_method = "tick_test"` returns explicit error (reserved) |
+| `[features]` | **IMPLEMENTED** | No `context` toggle — `activity`, `safety_gates`, `context` are always-on (not user-toggleable) |
+| `[vpin]` | **PARTIALLY IMPLEMENTED** | `bucket_volume_fraction` (relative-to-daily) deferred; uses fixed `bucket_volume = 5000` |
+| `[validation]` | **IMPLEMENTED** | Default `close_detection_gap_bins = 10` (spec text in §11 was wrong @ 5) |
+| `[sequence]`, `[labeling]`, `[export.split_dates]` | **IMPLEMENTED** | -- |
+| `[export]` | **PARTIALLY IMPLEMENTED** | Only `normalization = "per_day_zscore"` and `"none"` valid; `"global_zscore"` is **PLANNED**. Default is `"none"` (not `"per_day_zscore"`) |
+| `[publishers]` | **DEFERRED** | Uses hardcoded `PublisherClass::from_id()` in `src/reader/publisher.rs` |
+| Multi-config files (`nvda_10s.toml`, `nvda_vpin.toml`) | **EXAMPLE-ONLY** | Only `nvda_60s.toml` exists in `configs/`; the other examples illustrate the planned `[vpin]` and 10s schemas |
+
+When this schema and the code disagree, **the code is authoritative**. Schema corrections are tracked here as drift is discovered.
+
+---
+
 ## Table of Contents
 
 1. [Design Principles](#1-design-principles)
@@ -46,22 +68,27 @@ The config is parsed at pipeline startup by `src/config.rs` (implementing `serde
 > **Note**: Paths in example configs reference the parent monorepo data layout (`../data/...`). Adjust `data_dir`, `equs_summary_path`, and `output_dir` to match your local data location.
 
 ```toml
+# IMPLEMENTED sections (current code)
+
 [input]
-data_dir = "../data/XNAS_BASIC/NVDA/cmbp1_2025-02-03_to_2026-01-09"
-equs_summary_path = "../data/EQUS_SUMMARY/NVDA/ohlcv1d_2025-02-03_to_2026-03-05/equs-summary-*.ohlcv-1d.dbn.zst"
+data_dir = "./data/XNAS_BASIC/NVDA/cmbp1"
+equs_summary_path = "./data/EQUS_SUMMARY/NVDA/equs-summary.ohlcv-1d.dbn.zst"
 filename_pattern = "xnas-basic-{date}.cmbp-1.dbn.zst"
-start_date = "2025-02-03"
-end_date = "2026-01-08"
 symbol = "NVDA"
 
+[dates]
+start_date = "2025-02-03"
+end_date = "2026-01-06"
+exclude_dates = []                         # optional: holidays, halts to skip
+
 [sampling]
-strategy = "time_based"
-bin_size_seconds = 60
+strategy = "time_based"                    # only "time_based" currently valid
+bin_size_seconds = 60                      # one of {5,10,15,30,60,120,300,600}
 market_open_et = "09:30"
 market_close_et = "16:00"
 
 [classification]
-signing_method = "midpoint"
+signing_method = "midpoint"                # "tick_test" reserved (returns explicit error)
 exclusion_band = 0.10
 bjzz_lower = 0.001
 bjzz_upper_sell = 0.40
@@ -69,77 +96,99 @@ bjzz_lower_buy = 0.60
 bjzz_upper = 0.999
 
 [features]
+# Note: activity (27-28), safety_gates (29-30), context (31-33) are always-on
+# (not toggleable). Only the seven optional groups appear here.
 signed_flow = true
 venue_metrics = true
 retail_metrics = true
 bbo_dynamics = true
-vpin = false
+vpin = false                               # default disabled (requires daily volume context)
 trade_size = true
 cross_venue = true
-context = true
 
 [vpin]
-bucket_volume_fraction = 0.02
+bucket_volume = 5000                       # absolute shares per bucket (default)
+# bucket_volume_fraction = 0.02            # PLANNED: requires EQUS daily volume; not yet enforced
 lookback_buckets = 50
 sigma_window_minutes = 1
 
 [labeling]
+label_type = "point_return"                # only variant currently supported
 horizons = [1, 2, 3, 5, 10, 20, 30, 60]
-label_type = "point_return"
 
 [sequence]
 window_size = 20
 stride = 1
 
-[export]
-output_dir = "../data/exports/basic_nvda_60s"
-split_dates = { train_end = "2025-09-30", val_end = "2025-11-13" }
-normalization = "per_day_zscore"
-
 [validation]
 min_trades_per_bin = 10
 bbo_staleness_max_ns = 5_000_000_000
 warmup_bins = 3
-empty_bin_policy = "forward_fill_state"
+block_threshold = 10_000
+burst_threshold = 20
+empty_bin_policy = "forward_fill_state"    # one of "forward_fill_state","zero_all","nan_all"
 auto_detect_close = true
-close_detection_gap_bins = 5
+close_detection_gap_bins = 10              # default: 10 (10 minutes at 60s bins)
 
-[publishers]
-trf = [82, 83]
-lit = [81]
-minor_lit = [88, 89]
-include_minor_lit_in_lit = true
+[export]
+output_dir = "./data/exports/basic_nvda_60s"
+experiment = "basic_nvda"
+normalization = "none"                     # one of "per_day_zscore","none". Default: "none".
+continue_on_error = true
+
+[export.split_dates]
+train_end = "2025-09-30"
+val_end = "2025-11-13"
+
+# DEFERRED sections (NOT in code yet — illustrative only)
+#
+# [publishers]                             # DEFERRED: uses hardcoded PublisherClass::from_id()
+# trf = [82, 83]
+# lit = [81]
+# minor_lit = [88, 89]
+# include_minor_lit_in_lit = true
 ```
 
 ---
 
 ## 3. Section Reference: `[input]`
 
-Controls data source paths and date range for processing.
+Controls data source paths and ticker.
+
+> **Note**: Date range parameters (`start_date`, `end_date`, `exclude_dates`) live in the separate `[dates]` section (see §3.1), NOT in `[input]`. `[dates]` is required by `DatasetConfig` (the multi-day CLI config used by `export_dataset`); the library-level `ProcessorConfig` operates on a single day at a time and does not need a date range.
 
 | Parameter | Type | Default | Valid Range | Description |
 |-----------|------|---------|-------------|-------------|
 | `data_dir` | string | (required) | Valid directory path | Root directory containing XNAS.BASIC `.dbn.zst` files. One file per trading day. |
-| `equs_summary_path` | string | (required) | Valid glob path | Path (supports glob) to EQUS_SUMMARY `.dbn.zst` files. Provides daily consolidated volume for true dark share computation. |
-| `filename_pattern` | string | `"xnas-basic-{date}.cmbp-1.dbn.zst"` | Must contain `{date}` placeholder | Filename template for per-day XNAS.BASIC files. The `{date}` token is replaced with `YYYYMMDD`. |
-| `start_date` | string (date) | (required) | `YYYY-MM-DD`, must be a valid calendar date | First trading day to process (inclusive). Days without a corresponding file are skipped silently (weekends, holidays). |
-| `end_date` | string (date) | (required) | `YYYY-MM-DD`, must be >= `start_date` | Last trading day to process (inclusive). |
-| `symbol` | string | `"NVDA"` | Non-empty string | Ticker symbol. Used for metadata, logging, and EQUS_SUMMARY lookup. |
+| `equs_summary_path` | Option<string> | `None` (omit field) | Path to a single `.dbn.zst` OHLCV-1D file | Optional EQUS_SUMMARY path. When omitted, the pipeline proceeds without consolidated volume context (AD2: spec says required, code makes optional for library usability). |
+| `filename_pattern` | string | (required) | Must contain `{date}` placeholder | Filename template for per-day XNAS.BASIC files. The `{date}` token is replaced with `YYYYMMDD`. |
+| `symbol` | string | `"NVDA"` | Non-empty string | Ticker symbol. Used for metadata and logging. |
 
 ### Rationale
 
-- **`data_dir`**: Relative paths resolve from the config file's parent directory, consistent with MBO extractor conventions.
-- **`equs_summary_path`**: Glob support allows a single path to match multiple EQUS_SUMMARY files (one per download batch). The loader merges all matched files by date.
-- **`filename_pattern`**: The `{date}` placeholder pattern matches the Databento file naming convention. Alternative schemas (e.g., different naming for ARCX) can be specified without code changes.
-- **`start_date` / `end_date`**: The pipeline iterates calendar dates in this range. Missing files (weekends, holidays, gaps in data) produce a log entry and continue. This avoids requiring a separate trading calendar.
+- **`data_dir`**: Relative paths resolve from the working directory. Adjust to your local data layout.
+- **`equs_summary_path`**: Optional. When present, provides per-day consolidated volume for `consolidated_volume` and `trf_volume_fraction` metadata fields. When absent, those fields are `null` in metadata; pipeline still produces all 34 features.
+- **`filename_pattern`**: The `{date}` placeholder is replaced with `YYYYMMDD`. Alternative schemas (e.g., different naming for ARCX in the future) can be specified without code changes.
 
 ### Impact of Changes
 
 | Change | Effect |
 |--------|--------|
-| Narrowing date range | Fewer days processed. No impact on per-day results. |
-| Removing `equs_summary_path` | Error at startup. EQUS_SUMMARY is required for `dark_share` computation (true denominator). |
+| Removing `equs_summary_path` | Pipeline proceeds without daily volume context (informational only — does not affect feature values). |
 | Wrong `filename_pattern` | No files found. Pipeline exits with zero-day error at startup. |
+
+### 3.1 Section Reference: `[dates]` (required for `DatasetConfig`)
+
+| Parameter | Type | Default | Valid Range | Description |
+|-----------|------|---------|-------------|-------------|
+| `start_date` | string (date) | (required) | `YYYY-MM-DD`, must be a valid calendar date | First trading day to process (inclusive). |
+| `end_date` | string (date) | (required) | `YYYY-MM-DD`, must be >= `start_date` | Last trading day to process (inclusive). |
+| `exclude_dates` | array of string (date) | `[]` | Each `YYYY-MM-DD`, must parse as valid date | Dates to skip (holidays, halts). Optional. |
+
+### Rationale
+
+- **`start_date`/`end_date`**: The pipeline iterates calendar dates in this range. Missing files (weekends, holidays, gaps in data) produce a log entry and continue. This avoids requiring a separate trading calendar.
+- **`exclude_dates`**: Explicit holiday handling. Listed dates are skipped without producing log entries.
 
 ---
 
@@ -149,7 +198,7 @@ Controls how raw records are aggregated into discrete bins for feature computati
 
 | Parameter | Type | Default | Valid Range | Description |
 |-----------|------|---------|-------------|-------------|
-| `strategy` | string (enum) | `"time_based"` | `"time_based"` or `"volume_based"` | Sampling strategy. `time_based` uses fixed clock-time bins. `volume_based` uses dollar-volume bars (primarily for VPIN; see Section 7). |
+| `strategy` | string (enum) | `"time_based"` | `"time_based"` (only) | Sampling strategy. **Currently only `"time_based"` is implemented**; the spec mentions `"volume_based"` for future use, but the code rejects it with `"Unknown sampling strategy"`. VPIN computation (when enabled) uses an internal volume-bar accumulator regardless of this setting. |
 | `bin_size_seconds` | u32 | `60` | `{5, 10, 15, 30, 60, 120, 300, 600}` | Duration of each time bin in seconds. Only used when `strategy = "time_based"`. Bins are grid-aligned to `market_open_et`. |
 | `market_open_et` | string (time) | `"09:30"` | `HH:MM` in ET, must be before `market_close_et` | Eastern Time market open. First bin starts at this time. Grid alignment ensures bins are comparable across days. |
 | `market_close_et` | string (time) | `"16:00"` | `HH:MM` in ET, must be after `market_open_et` | Eastern Time market close. Records after this time are discarded (no post-market processing). The last bin may be shorter than `bin_size_seconds` if the session does not divide evenly. |
@@ -167,7 +216,7 @@ Controls how raw records are aggregated into discrete bins for feature computati
 |--------|--------|
 | `bin_size_seconds = 10` | ~2,340 bins/day (6x more). Higher temporal resolution but noisier features and more bins below `min_trades_per_bin`. Sequences represent 200s windows instead of 1200s. |
 | `bin_size_seconds = 120` | ~195 bins/day (3.25x fewer). Smoother features but lower sample count. Sequences represent 2400s (40min) windows. |
-| `strategy = "volume_based"` | Bins form when cumulative dollar volume reaches a threshold. Produces variable-length time intervals. Only valid with `[vpin]` section. Not supported for general feature export. |
+| `strategy = "volume_based"` | **Not currently implemented.** Planned for future: bins would form when cumulative dollar volume reaches a threshold, producing variable-length time intervals. |
 | Moving `market_open_et` to `"09:35"` | Skips first 5 minutes of trading. May avoid open-auction volatility but loses early-session signal. |
 
 ### Bin Count Formula
@@ -262,26 +311,35 @@ Toggles for independently enabling/disabling each feature group. Each group maps
 | `vpin` | bool | `false` | 2 | 18-19 | TRF-specific VPIN, lit-specific VPIN |
 | `trade_size` | bool | `true` | 4 | 20-23 | Mean trade size, block trade ratio, trade count, size concentration |
 | `cross_venue` | bool | `true` | 3 | 24-26 | TRF burst intensity, time since burst, TRF/lit volume ratio |
-| `context` | bool | `true` | 3 | 31-33 | Session progress, time bucket, schema version |
 
-Safety gates (indices 29-30: `bin_valid`, `bbo_valid`) and activity counts (indices 27-28: `bin_trade_count`, `bin_trf_trade_count`) are always emitted regardless of feature group toggles. They are structural fields required for downstream data integrity.
+**Always-on groups (NOT user-toggleable, no `[features]` field):**
+
+| Group | Feature Count | Index Range | Description |
+|-------|---------------|-------------|-------------|
+| activity | 2 | 27-28 | `bin_trade_count`, `bin_trf_trade_count` (always emitted) |
+| safety_gates | 2 | 29-30 | `bin_valid`, `bbo_valid` (always emitted; structural fields) |
+| context | 3 | 31-33 | `session_progress`, `time_bucket`, `schema_version` (always emitted) |
+
+These three groups are emitted regardless of any toggle. They are structural fields required for downstream data integrity. Attempting to set `context = true` (or any other always-on group) in `[features]` will cause TOML parse failure under `#[serde(deny_unknown_fields)]`.
 
 ### Feature Count Formula
 
-```
-F = (signed_flow ? 4 : 0)
-  + (venue_metrics ? 4 : 0)
-  + (retail_metrics ? 4 : 0)
-  + (bbo_dynamics ? 6 : 0)
-  + (vpin ? 2 : 0)
-  + (trade_size ? 4 : 0)
-  + (cross_venue ? 3 : 0)
-  + 2                           # activity (always present)
-  + 2                           # safety_gates (always present)
-  + (context ? 3 : 0)
+The output vector is **always 34 elements** regardless of toggles. Disabled groups produce zeros at their indices but still occupy slots (consistent shape for downstream tensors). The formula below counts ENABLED features (for metadata `feature_groups_enabled` only):
 
-Default: 4 + 4 + 4 + 6 + 0 + 4 + 3 + 2 + 2 + 3 = 32 features
-All enabled: 4 + 4 + 4 + 6 + 2 + 4 + 3 + 2 + 2 + 3 = 34 features
+```
+enabled_count = (signed_flow ? 4 : 0)
+              + (venue_metrics ? 4 : 0)
+              + (retail_metrics ? 4 : 0)
+              + (bbo_dynamics ? 6 : 0)
+              + (vpin ? 2 : 0)
+              + (trade_size ? 4 : 0)
+              + (cross_venue ? 3 : 0)
+              + 2                       # activity (always)
+              + 2                       # safety_gates (always)
+              + 3                       # context (always)
+
+Default: 4 + 4 + 4 + 6 + 0 + 4 + 3 + 2 + 2 + 3 = 32 enabled (34 emitted, 2 zeros at VPIN slots)
+All enabled: 4 + 4 + 4 + 6 + 2 + 4 + 3 + 2 + 2 + 3 = 34 enabled and emitted
 ```
 
 ### Rationale for Defaults
@@ -293,16 +351,15 @@ All enabled: 4 + 4 + 4 + 6 + 2 + 4 + 3 + 2 + 2 + 3 = 34 features
 - **`vpin = false`**: VPIN requires volume-based binning (dollar-volume bars), which is architecturally separate from the time-based bin pipeline. Enabling VPIN adds overhead and is only recommended when specifically investigating toxicity signals. See the `nvda_vpin.toml` example config.
 - **`trade_size = true`**: Block detection and trade size distribution. `block_trade_ratio` distinguishes uninformative large prints (Comerton-Forde and Putnins 2015) from informative small prints.
 - **`cross_venue = true`**: TRF burst detection captures sudden off-exchange activity shifts that may precede lit-market price moves.
-- **`context = true`**: Session progress and time bucket are required for intraday seasonality control.
+- **Context (always-on)**: `session_progress`, `time_bucket`, `schema_version` are required for intraday seasonality control and metadata. Not toggleable.
 
 ### Impact of Changes
 
 | Change | Effect |
 |--------|--------|
 | Disabling `signed_flow` | Loses the strongest predictive feature. Not recommended for production exports. Valid for ablation experiments. |
-| Enabling `vpin` | Adds 2 features (indices 18-19). Requires that the `[vpin]` section is also configured. VPIN computation is independent of time-bin feature extraction: it runs a parallel volume-bar accumulator. |
-| Disabling `context` | Loses session_progress and time_bucket. Sequences lose intraday position awareness. Downstream models cannot condition on time-of-day. |
-| Disabling all optional groups | Feature vector has only 4 columns (activity + safety_gates). Not useful for modeling but valid for data integrity testing. |
+| Enabling `vpin` | Activates 2 features (indices 18-19). Requires the `[vpin]` section to be configured. VPIN computation runs a parallel volume-bar accumulator inside the same time-binned pipeline. |
+| Disabling all optional groups | The 7 always-on features (activity 27-28, safety_gates 29-30, context 31-33) still emit. Indices 0-26 produce zeros. Not useful for modeling but valid for data integrity testing. |
 
 ---
 
@@ -312,9 +369,12 @@ Configures Volume-Synchronized Probability of Informed Trading computation. Only
 
 | Parameter | Type | Default | Valid Range | Description |
 |-----------|------|---------|-------------|-------------|
-| `bucket_volume_fraction` | f64 | `0.02` | `(0.0, 0.20]` | Fraction of average daily volume per VPIN bucket. `0.02` means each bucket captures 1/50 of daily volume. |
-| `lookback_buckets` | u32 | `50` | `[10, 500]` | Number of volume buckets in the VPIN rolling window. `50` means VPIN spans approximately one full trading day of volume. |
-| `sigma_window_minutes` | u32 | `1` | `[1, 60]` | Window size (in minutes) for computing the standard deviation of price changes used in BVC (Bulk Volume Classification). |
+| `bucket_volume` | u64 | `5000` | `> 0` | **Currently used.** Absolute shares per VPIN bucket. Default 5000 is conservative; tune by data size. |
+| `bucket_volume_fraction` | Option<f64> | `None` (omit) | `(0.0, 0.20]` | **PARTIALLY IMPLEMENTED.** When `Some(f)` AND daily volume from EQUS_SUMMARY is available, overrides `bucket_volume` with `(daily_volume * f) as u64`. When `None` (default) or EQUS unavailable, the absolute `bucket_volume` is used. The fully automatic fraction-based mode (Easley et al. 2012 §3) is not yet enforced via validation. |
+| `lookback_buckets` | usize | `50` | (no validation) | Number of volume buckets in the VPIN rolling window. `50` ≈ one full trading day of volume. |
+| `sigma_window_minutes` | u32 | `1` | (no validation) | Window size (in minutes) for computing the standard deviation of price changes used in BVC. |
+
+> **Note**: `[vpin]` parameters currently have NO validation in code (no `impl VpinConfig::validate`). Out-of-range values would not cause startup errors. Validation rules listed in §14 are PLANNED.
 
 ### Rationale
 
@@ -451,10 +511,12 @@ Controls NPY file output, train/val/test splitting, and normalization.
 | Parameter | Type | Default | Valid Range | Description |
 |-----------|------|---------|-------------|-------------|
 | `output_dir` | string | (required) | Valid directory path (created if absent) | Root output directory. Subdirectories `train/`, `val/`, `test/` are created automatically. |
+| `experiment` | string | `"basic_nvda"` | Non-empty | Experiment name for metadata. |
+| `continue_on_error` | bool | `true` | -- | When `true`, per-day failures are logged and the run continues. When `false`, the first failure aborts the run. |
 | `split_dates` | table | (required) | See below | Temporal split boundaries for train/val/test. |
-| `split_dates.train_end` | string (date) | `"2025-09-30"` | `YYYY-MM-DD`, must be >= `start_date` and < `val_end` | Last date in the training set (inclusive). |
-| `split_dates.val_end` | string (date) | `"2025-11-13"` | `YYYY-MM-DD`, must be > `train_end` and < `end_date` | Last date in the validation set (inclusive). Days after `val_end` through `end_date` are the test set. |
-| `normalization` | string (enum) | `"per_day_zscore"` | `"per_day_zscore"`, `"global_zscore"`, `"none"` | Normalization strategy applied to feature sequences before NPY export. |
+| `split_dates.train_end` | string (date) | `"2025-09-30"` | `YYYY-MM-DD`, must be >= `start_date` and <= `val_end` | Last date in the training set (inclusive). |
+| `split_dates.val_end` | string (date) | `"2025-11-13"` | `YYYY-MM-DD`, must be > `train_end` and <= `end_date` | Last date in the validation set (inclusive). Days after `val_end` through `end_date` are the test set. |
+| `normalization` | string (enum) | `"none"` | `"per_day_zscore"`, `"none"` | Normalization strategy applied to feature sequences before NPY export. **Default is `"none"`** (raw export; the trainer applies its own normalization). `"global_zscore"` is **PLANNED** but not currently valid. |
 
 ### Split Logic
 
@@ -468,24 +530,20 @@ This matches the temporal split used across all MBO pipeline experiments (163/35
 
 ### Normalization Strategies
 
-**`per_day_zscore`** (default):
-Per-day, per-feature z-score normalization. For each day independently:
+**`none`** (default):
+No normalization. Features exported in raw units. The downstream Python trainer applies its own normalization using training-set statistics (consistent with the MBO pipeline's `market_structure_zscore` approach in `lob-model-trainer`). The current default lets the trainer remain authoritative for normalization policy.
+
+**`per_day_zscore`**:
+Per-day, per-feature z-score normalization computed in Rust at export time. For each day independently:
 ```
 feature_normalized = (feature - mean_day) / (std_day + EPS)
 ```
-Statistics (mean, std) are computed from the training set only. For val/test days, the per-day training-set statistics are used. Categorical features (time_bucket, schema_version) are excluded from normalization.
+Statistics (mean, std) are computed via streaming Welford on the day's bins. Categorical features (indices 29, 30, 32, 33: bin_valid, bbo_valid, time_bucket, schema_version) are excluded from normalization.
 
-This is consistent with the MBO pipeline's `market_structure_zscore` strategy.
+The `{day}_normalization.json` sidecar always carries the per-day Welford statistics regardless of whether normalization is applied; consumers can re-normalize or denormalize using these stats.
 
-**`global_zscore`**:
-Compute mean and std across all training days, apply uniformly:
-```
-feature_normalized = (feature - mean_global) / (std_global + EPS)
-```
-Simpler but does not account for daily regime variation. May underperform for features with strong intraday patterns (e.g., dark_share varies systematically by day-of-week).
-
-**`none`**:
-No normalization. Features exported in raw units. Useful for analysis scripts and debugging. Not recommended for model training (features have different scales: volume in millions, spread in bps, ratios in [0,1]).
+**`global_zscore`** (PLANNED, not yet implemented):
+Would compute mean and std across all training days, apply uniformly. Currently rejected by `DatasetExportConfig::validate()` with `"normalization '{value}' must be one of [\"per_day_zscore\", \"none\"]"`.
 
 ### Output Files
 
@@ -509,8 +567,9 @@ Per dataset:
 
 | Change | Effect |
 |--------|--------|
-| `normalization = "none"` | Raw feature values. Requires downstream normalization in the trainer. Useful for custom normalization experiments. |
-| `normalization = "global_zscore"` | Single set of statistics across all training days. Simpler but less adaptive to daily regime shifts. |
+| `normalization = "none"` (default) | Raw feature values exported. The Python trainer applies its own normalization. |
+| `normalization = "per_day_zscore"` | Rust-side per-day z-score applied at export time. The `{day}_normalization.json` sidecar carries the stats either way. |
+| `normalization = "global_zscore"` | **Currently rejected.** Planned future strategy: single set of statistics across all training days. |
 | Changing `split_dates` | Moves the boundary between train/val/test. Ensure sufficient days in each split (minimum ~20 for meaningful statistics). |
 
 ---
@@ -521,12 +580,14 @@ Controls data quality gates, warmup, and empty-bin handling.
 
 | Parameter | Type | Default | Valid Range | Description |
 |-----------|------|---------|-------------|-------------|
-| `min_trades_per_bin` | u32 | `10` | `[1, 1000]` | Minimum number of TRF trades in a bin for `bin_valid = 1.0`. Below this threshold, `bin_valid = 0.0`, signaling to downstream models that the bin's flow features may be unreliable. |
-| `bbo_staleness_max_ns` | u64 | `5_000_000_000` | `[100_000_000, 60_000_000_000]` (100ms to 60s) | Maximum nanoseconds since the last BBO update before `bbo_valid = 0.0`. A stale BBO means the midpoint used for trade signing may be inaccurate. |
-| `warmup_bins` | u32 | `3` | `[0, 30]` | Number of bins to discard at the start of each trading day. Accumulators (running statistics, forward-fill state) need initial data before producing reliable features. |
+| `min_trades_per_bin` | u64 | `10` | `> 0` | Minimum number of TRF trades in a bin for `bin_valid = 1.0`. Below this threshold, `bin_valid = 0.0`. |
+| `bbo_staleness_max_ns` | u64 | `5_000_000_000` (5s) | `> 0` | Maximum nanoseconds since the last BBO update before `bbo_valid = 0.0`. |
+| `warmup_bins` | u32 | `3` | (no validation) | Number of bins to discard at the start of each trading day. |
+| `block_threshold` | u32 | `10_000` | `> 0` | Trade size threshold for block detection (used by `block_trade_ratio` feature). |
+| `burst_threshold` | u32 | `20` | (no validation) | TRF trades per 1-second window to trigger burst detection. |
 | `empty_bin_policy` | string (enum) | `"forward_fill_state"` | `"forward_fill_state"`, `"zero_all"`, `"nan_all"` | How to handle bins with zero TRF trades. |
 | `auto_detect_close` | bool | `true` | -- | If true, the pipeline detects early market close (NYSE half-days: July 3, day after Thanksgiving, Christmas Eve) by monitoring for consecutive empty bins. |
-| `close_detection_gap_bins` | u32 | `10` | `[2, 30]` | Number of consecutive bins with zero activity (no trades AND no BBO updates) before declaring the trading day complete. Default 10 at 60s bins (10 minutes) avoids LULD halt false positives. Only used when `auto_detect_close = true`. |
+| `close_detection_gap_bins` | u32 | `10` | `>= 1` | Number of consecutive bins with zero activity before declaring the trading day complete. **Default 10** at 60s bins = 10 minutes; chosen to avoid LULD halt false positives. Only used when `auto_detect_close = true`. |
 
 ### Empty Bin Policy Details
 
@@ -552,7 +613,7 @@ All features set to NaN for empty bins. Requires downstream NaN handling (imputa
 - **`bbo_staleness_max_ns = 5_000_000_000`** (5 seconds): Nasdaq BBO updates arrive at millisecond frequency during active trading. A 5-second gap indicates a data feed issue or trading halt. Using a stale BBO for midpoint signing degrades accuracy.
 - **`warmup_bins = 3`**: Three bins (3 minutes at 60s) allows accumulators to build initial state: forward-fill buffers are populated, running statistics have sufficient samples, and the first few noisy open-auction bins are excluded.
 - **`auto_detect_close = true`**: NYSE early-close days (approximately 3 per year) end at 13:00 ET instead of 16:00 ET. Rather than maintaining a hardcoded calendar, the pipeline detects the end of trading from the data. This is more robust to calendar changes and handles unexpected halts.
-- **`close_detection_gap_bins = 5`**: Five consecutive empty bins (5 minutes at 60s) is long enough to distinguish a genuine close from a brief lull in trading, but short enough to detect the close promptly. During active NVDA trading, even brief lulls almost never produce 5 consecutive bins with zero trades across all publishers.
+- **`close_detection_gap_bins = 10`**: Ten consecutive empty bins (10 minutes at 60s) is long enough to distinguish a genuine close from intraday LULD halts (typically <5 min) or other transient lulls, but short enough to detect early closes promptly. The original spec proposed 5 bins; raised to 10 in code to reduce false positives during halts.
 
 ### Impact of Changes
 
@@ -568,7 +629,11 @@ All features set to NaN for empty bins. Requires downstream NaN handling (imputa
 
 ---
 
-## 12. Section Reference: `[publishers]`
+## 12. Section Reference: `[publishers]` — DEFERRED
+
+> **DEFERRED**: This section is **not currently implemented** in code. There is no `PublishersConfig` struct in `src/config.rs`. Publisher classification uses the hardcoded `PublisherClass::from_id()` function in `src/reader/publisher.rs`. Adding this section to a TOML config will fail with `#[serde(deny_unknown_fields)]`.
+>
+> The intent of this section is preserved here for future implementation. When ready, it would map Databento publisher IDs to venue categories (TRF vs lit), allowing per-instrument or per-feed customization without code changes.
 
 Maps Databento publisher IDs to venue categories (TRF vs lit). These IDs are fixed by the XNAS.BASIC CMBP-1 schema.
 
@@ -613,195 +678,198 @@ Publisher 93 emits only BBO quote updates (~5.6M records/day) and zero trade rec
 
 ## 13. Non-Configurable Constants
 
-The following values are hardcoded constants that must NOT be exposed as configuration parameters. They are defined in `src/contract.rs` and verified against `contracts/pipeline_contract.toml` by `verify_rust_constants.py`.
+The following values are hardcoded constants that must NOT be exposed as configuration parameters. They are defined in `src/contract.rs` (the authoritative source for the standalone repo). The parent HFT-pipeline-v2 monorepo cross-validates these against `contracts/pipeline_contract.toml`.
 
 | Constant | Value | Type | Rationale |
 |----------|-------|------|-----------|
-| `EPS` | `1e-8` | f64 | Division guard for all denominators. Consistent across all pipeline modules (HFT pipeline convention). Changing this value would alter the numerical behavior of every feature computation. |
-| `FLOAT_CMP_EPS` | `1e-10` | f64 | Golden test comparison tolerance. Consistent across all modules. |
-| `SCHEMA_VERSION` | `"1.0"` | string | Schema version for off-exchange features. Emitted at feature index 33 as `1.0`. Changing requires a version bump in `pipeline_contract.toml` with synchronized updates in all consumers. |
-| `NANODOLLAR_SCALE` | `1e-9` | f64 | Databento FIXED_PRICE_SCALE for converting i64 wire prices to f64 USD. Defined by the Databento CMBP-1 schema. Not a pipeline choice. |
-| `BPS_SCALE` | `10000.0` | f64 | Basis points per unit: `return_bps = (p1/p0 - 1) * 10000`. Standard financial convention. |
-| Sign convention | `> 0 = Bullish` | -- | All signed features follow `> 0 = bullish, < 0 = bearish, = 0 = neutral`. Enforced in contract tests. Consistent with MBO pipeline (HFT pipeline convention (Rule 10: Sign Conventions)). |
-| Feature index assignments | See Section 6 | u32 | Feature-to-index mapping is a contract registered in `pipeline_contract.toml` under `[features.off_exchange]`. Changing indices is a breaking change. |
-| Categorical feature indices | `[31, 33]` | -- | `time_bucket` (index 31) and `schema_version` (index 33) are categorical. Never normalized. Consistent with MBO pipeline treatment of categorical indices. |
+| `EPS` | `1e-8` | f64 | Division guard for all denominators. Consistent across all pipeline modules. Changing this value would alter the numerical behavior of every feature computation. |
+| `SCHEMA_VERSION` | `1.0` | f64 | Schema version for off-exchange features. Emitted at feature index 33. Changing requires a contract version bump and synchronized updates in all consumers. |
+| `CONTRACT_VERSION` | `"off_exchange_1.0"` | &str | Off-exchange contract version string. Independent of MBO schema version (2.2). |
+| `NANO_TO_USD` | `1e-9` | f64 | Multiplier for converting i64 nanodollar wire prices to f64 USD. Defined by the Databento CMBP-1 schema (`dbn::FIXED_PRICE_SCALE` is its reciprocal `i64 = 1_000_000_000`). Not a pipeline choice. |
+| `UNDEF_PRICE` | `i64::MAX` | i64 | Sentinel value for undefined/missing prices in the dbn crate. Records with this value are rejected at the BBO update boundary. |
+| Sign convention | `> 0 = Bullish` | -- | All signed features follow `> 0 = bullish, < 0 = bearish, = 0 = neutral`. Enforced in contract tests. Consistent with the MBO pipeline. |
+| Feature index assignments | See `src/features/indices.rs` | usize | Feature-to-index mapping is a contract. Changing indices is a breaking change requiring a schema version bump. |
+| Categorical feature indices | `[29, 30, 32, 33]` (`bin_valid`, `bbo_valid`, `time_bucket`, `schema_version`) | -- | These four indices are never normalized. Verified by `test_categorical_indices_match_spec` in `src/features/indices.rs`. |
+| Non-normalizable indices | `[29, 30, 31, 32, 33]` | -- | Categorical indices PLUS `session_progress` (31), which is already in `[0, 1]`. Excluded from per-feature z-score. |
+| BPS scale literal | `10_000.0` (inline) | f64 | Basis points per unit: `return_bps = (p1/p0 - 1) * 10000`. Standard financial convention. Inlined in formulas; not currently a named constant. |
+
+**Tolerance constants used in tests** (not in `contract.rs`):
+- Tests typically compare with tolerance `1e-10` for f64 equality (e.g., `assert!((a - b).abs() < 1e-10)`). Some tests use `1e-15` for chained-operation expected values. These are inlined per-test; not a public constant.
 
 ### Why These Are Not Configurable
 
-- **EPS / FLOAT_CMP_EPS**: These are numerical infrastructure constants, not behavioral parameters. Making them configurable would create silent numerical divergence between experiments and between modules. Every division in the pipeline uses EPS. If one experiment uses 1e-8 and another uses 1e-10, their features are subtly different and non-comparable.
+- **EPS**: This is a numerical infrastructure constant, not a behavioral parameter. Making it configurable would create silent numerical divergence between experiments and between modules. Every division in the pipeline uses EPS. If one experiment uses 1e-8 and another uses 1e-10, their features are subtly different and non-comparable.
 - **SCHEMA_VERSION**: The schema version is a contract identifier, not a preference. It must match between producer (this pipeline) and consumer (trainer, backtester). It changes only when the feature layout changes (breaking change protocol).
 - **Sign convention**: Directional semantics must be consistent across all features in all modules. A sign flip in one feature would silently invert all downstream signal interpretations.
-- **Feature indices**: Indices are a contract surface consumed by Python code (`hft-contracts` auto-generation). Changing them silently breaks all downstream consumers.
+- **Feature indices**: Indices are a contract surface consumed by downstream Python code (the parent monorepo's `hft-contracts` package auto-generates Python constants from these). Changing them silently breaks all downstream consumers.
 
 ---
 
 ## 14. Config Validation Rules
 
-All validation occurs at config parse time in `PipelineConfig::from_toml()`. Any validation failure produces a descriptive error message and prevents pipeline startup. The pipeline never starts with invalid configuration.
+All validation occurs at config parse time in `ProcessorConfig::from_toml()` (single-day) or `DatasetConfig::from_toml()` (multi-day CLI). Any validation failure produces a descriptive error message and prevents pipeline startup.
 
-### Date Validation
+> **Note**: The rules below describe **only what the code currently enforces**. Rules listed under "PLANNED" sections are documented for future implementation. Out-of-range values for unvalidated parameters do not currently fail at startup.
+
+### Date Validation (`DateRangeConfig::validate`, `DatasetExportConfig::validate`)
+
+| Rule | Error Message (paraphrased) |
+|------|---------------|
+| `start_date` must parse as valid `YYYY-MM-DD` | parse error from `dates::parse_iso_date` |
+| `end_date` must parse as valid `YYYY-MM-DD` | parse error from `dates::parse_iso_date` |
+| `start_date <= end_date` | `"start_date ({}) must be <= end_date ({})"` |
+| Each `exclude_dates[i]` must parse | `"exclude_dates[{i}] '{value}': {parse_error}"` |
+| `train_end >= start_date` | `"train_end ({}) must be >= start_date ({})"` |
+| `val_end > train_end` | `"val_end ({}) must be > train_end ({})"` |
+| `val_end <= end_date` | `"val_end ({}) must be <= end_date ({})"` |
+
+### Sampling Validation (`SamplingConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `start_date` must parse as valid `YYYY-MM-DD` | `"Invalid start_date format: expected YYYY-MM-DD, got '{value}'"` |
-| `end_date` must parse as valid `YYYY-MM-DD` | `"Invalid end_date format: expected YYYY-MM-DD, got '{value}'"` |
-| `end_date >= start_date` | `"end_date ({end_date}) must be >= start_date ({start_date})"` |
-| `train_end >= start_date` | `"split_dates.train_end ({train_end}) must be >= start_date ({start_date})"` |
-| `val_end > train_end` | `"split_dates.val_end ({val_end}) must be > train_end ({train_end})"` |
-| `val_end < end_date` | `"split_dates.val_end ({val_end}) must be < end_date ({end_date})"` |
+| `strategy` must equal `"time_based"` | `"Unknown sampling strategy '{}'; only 'time_based' is supported"` |
+| `bin_size_seconds` must be in `{5, 10, 15, 30, 60, 120, 300, 600}` | `"bin_size_seconds ({}) must be one of [5, 10, ..., 600]"` |
 
-### Sampling Validation
+### Classification Validation (`ClassificationConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `strategy` must be `"time_based"` or `"volume_based"` | `"Invalid sampling strategy: '{value}'. Must be 'time_based' or 'volume_based'"` |
-| `bin_size_seconds` must be in `{5, 10, 15, 30, 60, 120, 300, 600}` | `"Invalid bin_size_seconds: {value}. Must be one of [5, 10, 15, 30, 60, 120, 300, 600]"` |
-| `market_open_et` must parse as `HH:MM` | `"Invalid market_open_et: expected HH:MM, got '{value}'"` |
-| `market_close_et` must parse as `HH:MM` | `"Invalid market_close_et: expected HH:MM, got '{value}'"` |
-| `market_close_et > market_open_et` | `"market_close_et ({close}) must be after market_open_et ({open})"` |
-| Session duration must be >= `bin_size_seconds` | `"Session duration ({dur}s) must be >= bin_size_seconds ({bin}s)"` |
+| `signing_method = "tick_test"` is reserved | `"tick_test signing not yet implemented; use 'midpoint' (default)"` |
+| Unknown enum variants | Rejected by serde at deserialization (typed enum) |
+| `exclusion_band` in `[0.0, 0.50]` | configurable check (see `types.rs`) |
+| BJZZ zone bounds (lower < upper, etc.) | configurable check (see `types.rs`) |
 
-### Classification Validation
+### Validation Section (`ValidationConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `signing_method` must be `"midpoint"` or `"tick_test"` | `"Invalid signing_method: '{value}'"`. `"tick_test"` is reserved: returns `"tick_test signing not yet implemented; use 'midpoint' (default)"` |
-| `exclusion_band` in `[0.0, 0.50]` | `"exclusion_band ({value}) must be in [0.0, 0.50]"` |
-| `0 < bjzz_lower < bjzz_upper_sell < 0.50` | `"BJZZ sell zone invalid: need 0 < lower ({l}) < upper_sell ({u}) < 0.50"` |
-| `0.50 < bjzz_lower_buy < bjzz_upper < 1.0` | `"BJZZ buy zone invalid: need 0.50 < lower_buy ({l}) < upper ({u}) < 1.0"` |
+| `min_trades_per_bin > 0` | `"min_trades_per_bin must be > 0"` |
+| `bbo_staleness_max_ns > 0` | `"bbo_staleness_max_ns must be > 0"` |
+| `block_threshold > 0` | `"block_threshold must be > 0"` |
+| `empty_bin_policy` in `{"forward_fill_state", "zero_all", "nan_all"}` | `"empty_bin_policy '{}' must be one of [\"forward_fill_state\", \"zero_all\", \"nan_all\"]"` |
+| `close_detection_gap_bins >= 1` | `"close_detection_gap_bins must be >= 1"` |
 
-### Feature Validation
-
-| Rule | Error Message |
-|------|---------------|
-| At least one feature group must be enabled | `"All feature groups disabled. At least one must be enabled."` |
-| If `vpin = true`, the `[vpin]` section must be present | `"features.vpin = true requires a [vpin] section"` |
-
-### VPIN Validation (only if `[features].vpin = true`)
+### Sequence Validation (`SequenceConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `bucket_volume_fraction` in `(0.0, 0.20]` | `"bucket_volume_fraction ({value}) must be in (0.0, 0.20]"` |
-| `lookback_buckets` in `[10, 500]` | `"lookback_buckets ({value}) must be in [10, 500]"` |
-| `sigma_window_minutes` in `[1, 60]` | `"sigma_window_minutes ({value}) must be in [1, 60]"` |
+| `window_size > 0` | `"window_size must be > 0"` |
+| `stride > 0` | `"stride must be > 0"` |
+| `stride <= window_size` | `"stride ({}) must be <= window_size ({})"` |
 
-### Labeling Validation
-
-| Rule | Error Message |
-|------|---------------|
-| `horizons` must be non-empty | `"horizons must not be empty"` |
-| Each horizon in `[1, 200]` | `"horizon {value} must be in [1, 200]"` |
-| `horizons` must be strictly ascending | `"horizons must be strictly ascending: {h1} >= {h2} at positions {i}, {i+1}"` |
-| No duplicate horizons | Implied by strictly ascending check |
-| `label_type` must be `"point_return"` | `"Invalid label_type: '{value}'. Only 'point_return' is supported."` |
-
-### Sequence Validation
+### Labeling Validation (`LabelConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `window_size` in `[1, 200]` | `"window_size ({value}) must be in [1, 200]"` |
-| `stride` in `[1, window_size]` | `"stride ({value}) must be in [1, window_size ({ws})]"` |
-| Enough bins for at least 1 sequence: `usable_bins - max(horizons) >= window_size` | `"Insufficient bins for sequences: usable_bins ({ub}) - max_horizon ({mh}) = {lb} < window_size ({ws}). Reduce window_size, max horizon, or increase session duration."` |
+| `horizons` must be non-empty | `"horizons must be non-empty"` |
+| Each horizon in `[1, 200]` | `"horizon[{i}] = {value} must be in [1, 200]"` |
+| `horizons` must be strictly ascending | `"horizons must be sorted ascending with no duplicates: ..."` |
 
-### Export Validation
-
-| Rule | Error Message |
-|------|---------------|
-| `normalization` must be `"per_day_zscore"`, `"global_zscore"`, or `"none"` | `"Invalid normalization: '{value}'"` |
-
-### Publisher Validation
+### Export Validation (`DatasetExportConfig::validate`)
 
 | Rule | Error Message |
 |------|---------------|
-| `trf` must be non-empty | `"publishers.trf must not be empty"` |
-| `lit` must be non-empty | `"publishers.lit must not be empty"` |
-| No overlap between `trf`, `lit`, `minor_lit` | `"Publisher ID {id} appears in multiple categories"` |
+| `normalization` in `{"per_day_zscore", "none"}` | `"normalization '{}' must be one of [\"per_day_zscore\", \"none\"]"` |
 
-### Cross-Section Validation
+### PLANNED Validation (NOT currently enforced)
 
-These rules validate consistency across multiple sections:
+These are documented for future implementation. Code does NOT enforce them as of Phase 5:
 
-| Rule | Error Message |
-|------|---------------|
-| `strategy = "volume_based"` requires `features.vpin = true` | `"sampling.strategy = 'volume_based' is only valid with features.vpin = true"` |
-| Total feature count > 0 | `"Computed feature count is 0. Enable at least one feature group."` |
+| PLANNED Rule | Why Deferred |
+|--------------|--------------|
+| `bucket_volume_fraction` in `(0.0, 0.20]` (when `features.vpin = true`) | Awaits full daily-volume integration |
+| `lookback_buckets` in `[10, 500]` | -- |
+| `sigma_window_minutes` in `[1, 60]` | -- |
+| Cross-section: `vpin = true` requires `[vpin]` section | Currently `[vpin]` always has defaults via `serde(default)` |
+| Cross-section: at least one feature group enabled | Currently 7 always-on features make this trivially true |
+| `[publishers]` validation (overlap between trf/lit/minor_lit) | `[publishers]` section deferred entirely |
+| `start_date` parse-error template "Invalid start_date format: ..." | Code uses parser's native error message instead |
 
 ---
 
 ## 15. Example Configs
 
-### 15.1 `nvda_60s.toml` -- Default Production Config
+### 15.1 `nvda_60s.toml` -- Default Production Config (MIRRORS `configs/nvda_60s.toml`)
 
-The standard configuration for 60-second bins. Matches the E5 bin size that produced the best tradeable results in the MBO pipeline.
+The standard configuration for 60-second bins. The shipped `configs/nvda_60s.toml` is a minimal version of this template (relies on `serde(default)` for unset values).
 
 ```toml
 # nvda_60s.toml -- Default production config for NVDA off-exchange features
 # Bin size: 60 seconds
-# Features: 32 (all groups except VPIN)
+# Default features: 32 enabled (all groups except VPIN), but the output vector is always 34 elements
 # Horizons: 8 (1 min to 60 min)
 # Expected sequences per day: ~308
 
 [input]
-data_dir = "../data/XNAS_BASIC/NVDA/cmbp1_2025-02-03_to_2026-01-09"
-equs_summary_path = "../data/EQUS_SUMMARY/NVDA/ohlcv1d_2025-02-03_to_2026-03-05/equs-summary-*.ohlcv-1d.dbn.zst"
+# IMPORTANT: Update these paths to your local Databento data location.
+data_dir = "./data/XNAS_BASIC/NVDA/cmbp1"
+equs_summary_path = "./data/EQUS_SUMMARY/NVDA/equs-summary.ohlcv-1d.dbn.zst"
 filename_pattern = "xnas-basic-{date}.cmbp-1.dbn.zst"
-start_date = "2025-02-03"
-end_date = "2026-01-08"
 symbol = "NVDA"
 
+[dates]
+start_date = "2025-02-03"
+end_date = "2026-01-06"
+exclude_dates = []
+
 [sampling]
-strategy = "time_based"
+strategy = "time_based"              # only "time_based" currently valid
 bin_size_seconds = 60                # E5 validated: IC=0.380 at 60s bins
-market_open_et = "09:30"             # Nasdaq regular session open
-market_close_et = "16:00"            # Nasdaq regular session close
+market_open_et = "09:30"
+market_close_et = "16:00"
 
 [classification]
 signing_method = "midpoint"          # Barber et al. (2024): 94.8% accuracy
-exclusion_band = 0.10                # 10% of spread -- conservative (15.4% unsigned)
+exclusion_band = 0.10
 bjzz_lower = 0.001                   # Boehmer et al. (2021) BJZZ thresholds
 bjzz_upper_sell = 0.40
 bjzz_lower_buy = 0.60
 bjzz_upper = 0.999
 
 [features]
+# (No `context` toggle — context, activity, safety_gates always-on)
 signed_flow = true                   # trf_signed_imbalance IC=+0.103 at H=1 (E9-CV)
 venue_metrics = true                 # dark_share IC=+0.035 at H=10 (E9-CV)
 retail_metrics = true                # subpenny_intensity IC=+0.104 at H=60 (E9-CV)
-bbo_dynamics = true                  # L1 spread dynamics
-vpin = false                         # Disabled: requires volume-bar architecture
-trade_size = true                    # Block detection, trade size distribution
-cross_venue = true                   # TRF burst detection
-context = true                       # Session progress, time bucket
+bbo_dynamics = true
+vpin = false                         # Default: disabled
+trade_size = true
+cross_venue = true
 
 [labeling]
-horizons = [1, 2, 3, 5, 10, 20, 30, 60]  # Point returns at 1 min to 60 min
-label_type = "point_return"               # E8 lesson: no smoothed labels
+label_type = "point_return"          # E8 lesson: no smoothed labels
+horizons = [1, 2, 3, 5, 10, 20, 30, 60]
 
 [sequence]
 window_size = 20                     # 20 bins = 20 minutes of history
-stride = 1                          # Maximum overlap for training
-
-[export]
-output_dir = "../data/exports/basic_nvda_60s"
-split_dates = { train_end = "2025-09-30", val_end = "2025-11-13" }  # 163/35/35 days
-normalization = "per_day_zscore"     # Consistent with MBO pipeline
+stride = 1                           # Maximum overlap for training
 
 [validation]
-min_trades_per_bin = 10              # Safety gate: ~3800 avg TRF trades per 60s bin
+min_trades_per_bin = 10
 bbo_staleness_max_ns = 5_000_000_000  # 5 seconds
-warmup_bins = 3                      # 3 minutes warmup at session open
+warmup_bins = 3
+block_threshold = 10_000
+burst_threshold = 20
 empty_bin_policy = "forward_fill_state"
 auto_detect_close = true
-close_detection_gap_bins = 5         # 5 empty minutes = end of day
+close_detection_gap_bins = 10        # 10 empty minutes = end-of-day signal
 
-[publishers]
-trf = [82, 83]                       # FINRA TRF Carteret + Chicago
-lit = [81]                           # XNAS lit
-minor_lit = [88, 89]                 # XBOS, XPSX
-include_minor_lit_in_lit = true
+[export]
+output_dir = "./data/exports/basic_nvda_60s"
+experiment = "basic_nvda_60s"
+normalization = "none"               # Default: trainer normalizes downstream
+continue_on_error = true
+
+[export.split_dates]
+train_end = "2025-09-30"
+val_end = "2025-11-13"
+
+# [publishers] section is DEFERRED — uses hardcoded PublisherClass::from_id() in src/reader/publisher.rs
 ```
 
-### 15.2 `nvda_10s.toml` -- Fine-Grained Config
+### 15.2 `nvda_10s.toml` -- Fine-Grained Config (PLANNED EXAMPLE — not yet in `configs/`)
+
+> **Status**: This config is illustrative — `configs/nvda_10s.toml` does NOT exist in the repo. It documents the intended schema for a fine-grained 10-second variant. To create one, copy `configs/nvda_60s.toml` and apply the differences below. Then place it at `configs/nvda_10s.toml` and update the deferred-config status here.
 
 Higher temporal resolution for investigating short-horizon signals. Produces more bins per day but with noisier per-bin estimates.
 
@@ -847,7 +915,7 @@ bbo_dynamics = true
 vpin = false
 trade_size = true
 cross_venue = true
-context = true
+# (no `context` toggle — context, activity, safety_gates always-on)
 
 [labeling]
 # Horizons scaled to match real-time durations similar to 60s config:
@@ -870,13 +938,9 @@ bbo_staleness_max_ns = 2_000_000_000  # 2 seconds: tighter for finer bins
 warmup_bins = 10                     # 100 seconds warmup (comparable to 3 bins at 60s)
 empty_bin_policy = "forward_fill_state"
 auto_detect_close = true
-close_detection_gap_bins = 30        # 30 empty 10s bins = 5 minutes (same real-time gap)
+close_detection_gap_bins = 60        # 60 empty 10s bins = 10 minutes (matches new 60s default)
 
-[publishers]
-trf = [82, 83]
-lit = [81]
-minor_lit = [88, 89]
-include_minor_lit_in_lit = true
+# [publishers] section — DEFERRED (uses hardcoded PublisherClass::from_id())
 ```
 
 **Key differences from default**:
@@ -884,10 +948,12 @@ include_minor_lit_in_lit = true
 - `window_size = 60`: Same real-time window (10 minutes) at higher resolution
 - `min_trades_per_bin = 3`: Lower threshold because bins have ~630 TRF trades on average (vs ~3,800 at 60s)
 - `warmup_bins = 10`: 100 seconds (comparable to 3 minutes at 60s)
-- `close_detection_gap_bins = 30`: Same 5-minute real-time gap at 10s resolution
+- `close_detection_gap_bins = 60`: Same 10-minute real-time gap at 10s resolution
 - `horizons` scaled to match similar real-time durations as the 60s config
 
-### 15.3 `nvda_vpin.toml` -- VPIN-Focused Config
+### 15.3 `nvda_vpin.toml` -- VPIN-Focused Config (PLANNED EXAMPLE — not yet in `configs/`)
+
+> **Status**: This config is illustrative — `configs/nvda_vpin.toml` does NOT exist in the repo. It documents the intended schema for a VPIN-enabled variant. Note that `bucket_volume_fraction` is not yet enforced by code; the absolute `bucket_volume = 5000` (default) is used regardless.
 
 Enables VPIN computation alongside standard time-based features. VPIN uses a parallel volume-bar accumulator while other features use time bins.
 
@@ -935,7 +1001,7 @@ bbo_dynamics = true
 vpin = true                          # ENABLED: adds trf_vpin (idx 18) + lit_vpin (idx 19)
 trade_size = true
 cross_venue = true
-context = true
+# (no `context` toggle — context, activity, safety_gates always-on)
 
 [vpin]
 bucket_volume_fraction = 0.02        # 1/50 daily vol per bucket (Easley et al. 2012, Section 3)
@@ -961,12 +1027,12 @@ bbo_staleness_max_ns = 5_000_000_000
 warmup_bins = 3
 empty_bin_policy = "forward_fill_state"
 auto_detect_close = true
-close_detection_gap_bins = 5
+close_detection_gap_bins = 10
 
-[publishers]
-trf = [82, 83]
-lit = [81]
-minor_lit = [88, 89]
+# [publishers] section — DEFERRED (uses hardcoded PublisherClass::from_id())
+# trf = [82, 83]
+# lit = [81]
+# minor_lit = [88, 89]
 include_minor_lit_in_lit = true
 ```
 

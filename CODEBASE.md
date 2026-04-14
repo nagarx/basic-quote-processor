@@ -227,12 +227,29 @@ These were identified during a 3-agent deep audit of all 40 source files. None a
 - **`SamplingConfig.strategy` and `ValidationConfig.empty_bin_policy` are String, not enum** — validated at runtime against hardcoded lists. Should be proper Rust enums for type-level safety.
 - **No `Sampler` trait** — `TimeBinSampler` is hardwired in `pipeline.rs`. Extract trait when adding volume-based or composite sampling.
 - **BVC uses sample variance (n-1), BurstTracker uses population variance (n)** — both defensible for their contexts (BVC estimates population parameter from sample, BurstTracker is descriptive statistic of bin data).
+- **`ExportMetadata.normalization.strategy` is hardcoded to `"per_day_zscore"`** in `src/export/metadata.rs:232` regardless of the actual `[export].normalization` config value. Only the `applied: bool` field reflects whether normalization was actually applied. Trainer should rely on `applied` not `strategy` until this is fixed.
+
+### Test Coverage Roadmap (Future Work)
+
+A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the safety net without requiring code changes:
+
+1. **Half-day auto-detect unit test** — inject 10 synthetic empty bins; assert `set_session_end()` is called. Currently relies on Christmas Eve real-data file.
+2. **DST transition tests** — `TimeBinSampler::init_day(2025, 3, 9)` (spring forward) and `(2025, 11, 2)` (fall back); verify offset switches.
+3. **File with only trades, no quotes** — verify `TradeClassifier` correctly returns `Unsigned + Unknown` for all trades when no BBO updates exist.
+4. **Truly empty `.dbn.zst` file** — current `test_edge_empty_iterator` uses `.take(0)`; need a test on a zero-record file.
+5. **Convert `debug_assert!` → `assert!` in `src/features/mod.rs:164-179`** for safety_gates, schema_version, session_progress range — currently invariants are stripped in release builds.
+6. **Sign convention contract test** — explicit per-feature: `buy_vol > sell_vol` ⇒ `trf_signed_imbalance > 0`; same for mroib, bvc_imbalance, quote_imbalance.
+7. **VPIN below bucket_volume fallback** — feed one trade; verify `trf_vpin = 0.0` (not NaN).
+8. **Gap-bin-at-end-of-day** — synthetic stream where the last emitted bin is a gap; verify `last_bin_end_ns` reflects the gap.
+9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.
+10. **Integration test gating** — currently silently SKIP without data; add `CI=true` panic to prevent silent zero-coverage CI runs.
+11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback.
 
 ---
 
 ## Design Specification
 
-See `docs/design/` (7 documents, 6,993 lines):
+See `docs/design/` (7 documents, ~7,000 lines):
 - 01_THEORETICAL_FOUNDATION.md — 47 papers, trade classification theory
 - 02_MODULE_ARCHITECTURE.md — Repository structure, design decisions
 - 03_DATA_FLOW.md — End-to-end data flow, BBO ordering

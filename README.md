@@ -68,7 +68,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
                     dates.rs --> weekday enumeration, split assignment
 ```
 
-13 modules, 35 source files, 412 tests.
+13 modules, 41 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 5 integration test files, **412 tests** (365 lib + 47 integration).
 
 ## Feature Groups (34 total, indices 0-33)
 

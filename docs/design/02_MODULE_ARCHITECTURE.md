@@ -47,125 +47,140 @@ After 15 experiments (E1-E9, F1, P0, R1-R8), we established that MBO-only featur
 
 ---
 
-## 2. Directory Structure
+## 2. Directory Structure (Actual Implementation, Phase 5)
+
+This tree shows the ACTUAL repository layout as of Phase 5. The original spec described a more granular per-feature-group file decomposition; the implementation consolidated feature extraction into `src/features/mod.rs` (extractor) + `src/features/indices.rs` (constants and classification) — see §5 "Pattern Justification" for rationale.
 
 ```
 basic-quote-processor/
-├── Cargo.toml                    # Rust crate, depends on hft-statistics
-├── .cargo/config.toml            # Local path patches
-├── CODEBASE.md                   # Technical reference (REQUIRED)
-├── CLAUDE.md                     # LLM coding guide
-├── README.md                     # Quick start
-├── CHANGELOG.md                  # Version history
-│
-├── src/
-│   ├── lib.rs                    # Public API re-exports
-│   ├── error.rs                  # Error types (thiserror)
-│   ├── contract.rs               # Schema version, feature indices, EPS constants
-│   ├── config.rs                 # PipelineConfig (serde::Deserialize from TOML)
-│   ├── pipeline.rs               # Main Pipeline orchestrator
-│   ├── builder.rs                # PipelineBuilder fluent API
-│   │
-│   ├── reader/                   # Data ingestion (directory module)
-│   │   ├── mod.rs                # Re-exports
-│   │   ├── dbn_reader.rs         # Databento .dbn.zst file reader
-│   │   ├── record.rs             # CmbpRecord type (our internal repr of CMBP-1)
-│   │   └── publisher.rs          # PublisherId enum (XNAS=81, FINN=82, FINC=83, XBOS=88, XPSX=89)
-│   │
-│   ├── bbo_state/                # L1 book state tracking (directory module)
-│   │   ├── mod.rs                # BboState type + update logic
-│   │   ├── midpoint.rs           # Midpoint, spread, microprice computation
-│   │   └── validation.rs         # BBO validity checks (spread > 0, finite prices)
-│   │
-│   ├── trade_classifier/         # Trade signing + retail identification (directory module)
-│   │   ├── mod.rs                # TradeClassifier orchestrator
-│   │   ├── midpoint_signer.rs    # Barber (2024) midpoint signing with configurable exclusion band
-│   │   ├── bjzz.rs               # BJZZ retail identification (Boehmer 2021)
-│   │   ├── bvc.rs                # Bulk Volume Classification (Easley 2012)
-│   │   └── types.rs              # ClassifiedTrade, TradeDirection, RetailStatus enums
-│   │
-│   ├── features/                 # Feature computation (directory module)
-│   │   ├── mod.rs                # FeatureExtractor orchestrator
-│   │   ├── config.rs             # FeatureConfig (which groups enabled)
-│   │   ├── signed_flow.rs        # trf_signed_imbalance, mroib, inv_inst_direction
-│   │   ├── venue_metrics.rs      # dark_share, trf_volume, lit_volume, total_volume
-│   │   ├── retail_metrics.rs     # subpenny_intensity, odd_lot_ratio, retail_trade_rate
-│   │   ├── vpin.rs               # Volume-synchronized VPIN (Easley 2012, volume-bar BVC)
-│   │   ├── kyle_lambda.rs        # FUTURE: Rolling Kyle's lambda (NOT in 34-feature index; requires KyleLambda in hft-statistics, not yet implemented)
-│   │   ├── bbo_dynamics.rs       # L1 spread dynamics, bid/ask pressure from quote updates
-│   │   ├── trade_size.rs         # Block detection, trade size distribution, round-lot ratio
-│   │   ├── cross_venue.rs        # TRF burst detection, quote-trade timing
-│   │   └── experimental.rs       # Future experimental features (behind feature flag)
-│   │
-│   ├── sampling/                 # Time-bin sampling (directory module)
-│   │   ├── mod.rs                # Sampler trait + TimeBinSampler
-│   │   ├── time_bin.rs           # Fixed-interval time bins (configurable: 10s, 30s, 60s, etc.)
-│   │   └── volume_bin.rs         # Dollar-volume bins for VPIN (Easley 2021)
-│   │
-│   ├── accumulator/              # Per-bin feature accumulation (directory module)
-│   │   ├── mod.rs                # BinAccumulator orchestrator
-│   │   ├── flow_accumulator.rs   # Accumulates signed volume per bin
-│   │   ├── count_accumulator.rs  # Accumulates trade counts per bin
-│   │   └── stats_accumulator.rs  # Running statistics per bin (Welford via hft-statistics)
-│   │
-│   ├── sequence_builder/         # Sequence construction for ML (directory module)
-│   │   ├── mod.rs                # SequenceBuilder
-│   │   └── window.rs             # Sliding window over feature bins
-│   │
-│   ├── labeling/                 # Return labels (directory module)
-│   │   ├── mod.rs                # LabelComputer
-│   │   ├── point_return.rs       # Point-to-point return at H bins ahead (bps)
-│   │   └── forward_prices.rs     # Forward mid-price trajectory export
-│   │
-│   └── export/                   # NPY/JSON export (directory module)
-│       ├── mod.rs                # Exporter orchestrator
-│       ├── npy_export.rs         # NPY file writer
-│       ├── metadata.rs           # Metadata JSON (schema_version, provenance, etc.)
-│       └── normalization.rs      # Per-day normalization stats export
-│
-├── bin/
-│   ├── export_dataset.rs         # CLI: process days -> NPY exports
-│   ├── profile_data.rs           # CLI: compute per-day statistics (trade counts, volumes, etc.)
-│   └── validate_coverage.rs      # CLI: cross-check against EQUS_SUMMARY
+├── .gitignore                      # excludes target/, .DS_Store, .cargo/config.toml
+├── .cargo/                         # (gitignored) optional local path patches for dev
+├── Cargo.toml                      # Rust crate manifest; deps via git for hft-statistics + dbn
+├── Cargo.lock                      # committed for binary crates (3 binaries)
+├── LICENSE                         # proprietary
+├── README.md                       # Quick start, prerequisites, output format
+├── CODEBASE.md                     # Operational technical reference (REQUIRED reading)
 │
 ├── configs/
-│   ├── nvda_60s.toml             # Default: 60s bins, all features, H=1..60
-│   ├── nvda_10s.toml             # Fine-grained: 10s bins
-│   └── nvda_vpin.toml            # VPIN-focused: volume bins
+│   └── nvda_60s.toml               # production 60s-bin config (the only shipped config)
 │
-├── tests/
-│   ├── contract_test.rs          # Feature indices match contract
-│   ├── formula_test.rs           # Math verification with hand-calculated values
-│   ├── edge_test.rs              # 0, NaN, Inf, near-zero, spread<=0
-│   ├── signing_test.rs           # Trade classification accuracy
-│   ├── integration_test.rs       # End-to-end: raw .dbn.zst -> NPY
-│   └── golden_test.rs            # Deterministic output for fixed input
+├── docs/
+│   └── design/                     # 7-document design specification (this file is 02)
+│       ├── 01_THEORETICAL_FOUNDATION.md
+│       ├── 02_MODULE_ARCHITECTURE.md
+│       ├── 03_DATA_FLOW.md
+│       ├── 04_FEATURE_SPECIFICATION.md
+│       ├── 05_CONFIGURATION_SCHEMA.md
+│       ├── 06_INTEGRATION_POINTS.md
+│       └── 07_TESTING_STRATEGY.md
 │
-├── analysis/                     # Python analysis scripts
-│   ├── requirements.txt          # databento, numpy, scipy, pandas
-│   ├── explore_cmbp1.py          # Data exploration and statistics
-│   ├── signal_validation.py      # IC computation and horizon sweep
-│   ├── coverage_analysis.py      # EQUS_SUMMARY cross-check
-│   └── feature_correlation.py    # Feature correlation matrix
+├── src/
+│   ├── lib.rs                      # Crate root: 13 public modules + Phase 1-5 re-exports
+│   ├── error.rs                    # ProcessorError enum (8 variants) + Result alias
+│   ├── contract.rs                 # EPS, NANO_TO_USD, SCHEMA_VERSION, CONTRACT_VERSION,
+│   │                               #   DEFAULT_HORIZONS, FEATURE_NAMES[34], TOTAL_FEATURES
+│   ├── config.rs                   # ProcessorConfig, DatasetConfig + 10 sub-config structs
+│   ├── pipeline.rs                 # DayPipeline orchestrator: init -> stream -> finalize
+│   ├── context.rs                  # DailyContextLoader (EQUS_SUMMARY OHLCV-1D)
+│   ├── dates.rs                    # Weekday/Split enums, date parsing, file-name formatting
+│   │
+│   ├── reader/                     # Data ingestion
+│   │   ├── mod.rs                  # Re-exports
+│   │   ├── dbn_reader.rs           # DbnReader, RecordIterator, discover_files()
+│   │   ├── record.rs               # CmbpRecord (12 fields: ts_event, ts_recv, action, side,
+│   │   │                           #   flags, price, size, bid_px, bid_sz, ask_px, ask_sz,
+│   │   │                           #   publisher_id) — preserves i64 nanodollars
+│   │   └── publisher.rs            # PublisherClass enum + 6 named ID constants
+│   │
+│   ├── bbo_state/                  # L1 BBO tracking
+│   │   ├── mod.rs                  # BboState (14 fields, single i64→f64 conversion point)
+│   │   ├── midpoint.rs             # midpoint(), spread_bps(), microprice() pure functions
+│   │   └── validation.rs           # is_valid_bbo(), staleness_ns()
+│   │
+│   ├── trade_classifier/           # Trade signing + retail ID + BVC
+│   │   ├── mod.rs                  # TradeClassifier orchestrator
+│   │   ├── midpoint_signer.rs      # sign_midpoint() — Barber (2024)
+│   │   ├── bjzz.rs                 # fractional_cent(), identify_retail() — Boehmer (2021)
+│   │   ├── bvc.rs                  # BvcState — Easley (2012) Eq. 7
+│   │   └── types.rs                # TradeDirection, RetailStatus, ClassifiedTrade,
+│   │                               #   ClassificationConfig, SigningMethod
+│   │
+│   ├── sampling/                   # Time-bin sampling
+│   │   ├── mod.rs                  # Re-exports
+│   │   └── time_bin_sampler.rs     # TimeBinSampler, BinBoundary (grid-aligned, DST-aware)
+│   │
+│   ├── accumulator/                # Per-bin state (6 sub-accumulators)
+│   │   ├── mod.rs                  # BinAccumulator orchestrator + DaySummary
+│   │   ├── flow_accumulator.rs     # FlowAccumulator: TRF buy/sell/retail volumes per venue
+│   │   ├── count_accumulator.rs    # CountAccumulator: total/trf/lit/retail/subpenny/odd_lot/block
+│   │   ├── stats_accumulator.rs    # StatsAccumulator: TWAP spread, BBO snapshots, HHI
+│   │   ├── burst_tracker.rs        # BurstTracker: inter-arrival CV, time_since_burst
+│   │   └── forward_fill.rs         # ForwardFillState: 3-level empty bin policy
+│   │
+│   ├── features/                   # Feature extraction (single-file extractor + indices)
+│   │   ├── mod.rs                  # FeatureExtractor (stateless reader of accumulator state).
+│   │   │                           #   Contains all 10 group extraction methods inline.
+│   │   └── indices.rs              # 34 named constants, group ranges, classification arrays
+│   │
+│   ├── sequence_builder/           # Sliding window
+│   │   └── mod.rs                  # FeatureVec = Arc<Vec<f64>>, build_all_from_slice()
+│   │
+│   ├── labeling/                   # Point-return labels + forward prices
+│   │   ├── mod.rs                  # Re-exports
+│   │   ├── point_return.rs         # LabelComputer, LabelResult (multi-horizon bps)
+│   │   └── forward_prices.rs       # ForwardPriceComputer ([N, max_H+1] f64 USD)
+│   │
+│   ├── export/                     # NPY + JSON export
+│   │   ├── mod.rs                  # DayExport, DayExporter (atomic write + rollback)
+│   │   ├── npy_writer.rs           # write_sequences (f32), write_labels (f64), write_forward_prices (f64)
+│   │   ├── normalization.rs        # NormalizationComputer (per-feature Welford streaming)
+│   │   ├── metadata.rs             # ExportMetadata + builder pattern
+│   │   └── manifest.rs             # DatasetManifest (multi-day completion tracking)
+│   │
+│   └── bin/                        # 3 CLI binaries
+│       ├── export_dataset.rs       # multi-day NPY export with train/val/test splits
+│       ├── validate_coverage.rs    # TRF + lit volume vs EQUS_SUMMARY coverage check
+│       └── profile_data.rs         # per-day diagnostic statistics
 │
-└── docs/
-    ├── FEATURE_REFERENCE.md      # All features with formulas, indices, units
-    └── CONFIG_REFERENCE.md       # All TOML config parameters
+└── tests/                          # 47 integration tests (data-gated)
+    ├── integration_test.rs         # Phase 1: DbnReader + BBO tracking on real data
+    ├── classifier_test.rs          # Phase 2: classification + golden vectors
+    ├── phase3_test.rs              # Phase 3: full feature extraction pipeline
+    ├── phase4_test.rs              # Phase 4: pipeline + export + NPY shape contract
+    └── phase5_test.rs              # Phase 5: EQUS context + multi-day pipeline
 ```
+
+### Files NOT in This Repo (originally proposed in earlier spec drafts)
+
+The following files were proposed in pre-implementation spec drafts but were never created. They are listed here so spec readers don't expect them:
+
+| Spec mentioned | Status | Replacement / Notes |
+|----------------|--------|---------------------|
+| `src/builder.rs` (PipelineBuilder fluent API) | NOT created | `DayPipeline::new(...)` is the only constructor |
+| `src/features/{config,signed_flow,venue_metrics,retail_metrics,vpin,kyle_lambda,bbo_dynamics,trade_size,cross_venue,experimental}.rs` | NOT created | Consolidated into `src/features/mod.rs` (one method per group, all in one file). Decomposition is deferred until `mod.rs` exceeds maintainability thresholds. |
+| `src/sampling/{time_bin,volume_bin}.rs` | NOT created | Single file `time_bin_sampler.rs`. `volume_bin.rs` is DEFERRED with the volume-based sampling strategy. |
+| `src/sequence_builder/window.rs` | NOT created | Logic lives in `sequence_builder/mod.rs` |
+| `src/export/npy_export.rs` | NOT created | Renamed to `export/npy_writer.rs` |
+| `tests/{contract,formula,edge,signing,golden}_test.rs` | NOT created | Tests are organized by Phase: `phase3/4/5_test.rs` cover formula+edge+integration; `classifier_test.rs` covers signing+golden vectors; `integration_test.rs` covers Phase 1 reader edge cases |
+| `analysis/` (Python scripts: requirements.txt, explore_cmbp1.py, signal_validation.py, coverage_analysis.py, feature_correlation.py) | DEFERRED | Phase 6 (Python analysis scripts) is not yet implemented. Equivalent analysis happens in the parent monorepo (`MBO-LOB-analyzer`, `lob-dataset-analyzer`). |
+| `docs/FEATURE_REFERENCE.md`, `docs/CONFIG_REFERENCE.md` | NOT created | Replaced by `docs/design/04_FEATURE_SPECIFICATION.md` and `docs/design/05_CONFIGURATION_SCHEMA.md` |
+| `CHANGELOG.md` | NOT created | Will be added at v0.2.0; v0.1.0 is the initial release |
+| `CLAUDE.md` | NOT created (in this repo) | LLM coding context lives in the parent monorepo's `.claude/`. The standalone repo relies on `CODEBASE.md` + `docs/design/` for context. |
 
 ### File Roles
 
 | File / Directory | Purpose |
 |---|---|
-| `lib.rs` | Public API surface -- re-exports `Pipeline`, `PipelineBuilder`, `PipelineConfig`, key types |
-| `error.rs` | Centralized error enum using `thiserror`. All modules return `Result<T, Error>` |
-| `contract.rs` | Schema version, feature index constants, `EPS` (1e-8). Mirrors `pipeline_contract.toml` values. Validated by `verify_rust_constants.py` |
-| `config.rs` | `PipelineConfig` struct deserialized from TOML via `serde`. All behavior configurable |
-| `pipeline.rs` | Orchestrates the per-day processing lifecycle (init -> stream -> finalize). Owns all sub-modules |
-| `builder.rs` | `PipelineBuilder` fluent API for programmatic construction (tests, CLI) |
-| `bin/export_dataset.rs` | Production CLI entry point. Iterates days, calls `Pipeline`, writes NPY/JSON |
-| `bin/profile_data.rs` | Diagnostic CLI. Prints per-day statistics (trade counts, volumes, BBO update rates) |
-| `bin/validate_coverage.rs` | Validation CLI. Cross-checks TRF/lit volumes against EQUS_SUMMARY consolidated volume |
+| `lib.rs` | Public API surface -- re-exports `DayPipeline`, `ProcessorConfig`, `DatasetConfig`, key types |
+| `error.rs` | Centralized error enum using `thiserror`. All modules return `Result<T, ProcessorError>` |
+| `contract.rs` | Pipeline constants: `EPS`, `NANO_TO_USD`, `SCHEMA_VERSION`, `CONTRACT_VERSION`, `DEFAULT_HORIZONS`, `FEATURE_NAMES[34]`, `TOTAL_FEATURES`. Authoritative for the standalone repo. |
+| `config.rs` | `ProcessorConfig` (per-day, library) and `DatasetConfig` (multi-day, CLI) deserialized from TOML via `serde`. All behavior configurable. |
+| `pipeline.rs` | `DayPipeline` orchestrator: per-day processing lifecycle (`init_day` → `stream_file` → `finalize`). Owns all sub-modules. |
+| `context.rs` | `DailyContextLoader` reads EQUS_SUMMARY OHLCV-1D for per-day consolidated volume context. |
+| `dates.rs` | Weekday enumeration, train/val/test split assignment, date format helpers. |
+| `bin/export_dataset.rs` | Production CLI: iterates days, calls `DayPipeline`, writes NPY/JSON via `DayExporter`. |
+| `bin/profile_data.rs` | Diagnostic CLI: prints per-day statistics (trade counts, volumes, BBO update rates). |
+| `bin/validate_coverage.rs` | Validation CLI: cross-checks TRF/lit volumes against EQUS_SUMMARY consolidated volume. |
 
 ---
 

@@ -73,7 +73,7 @@ For downstream fusion to work, both producers must agree on temporal alignment. 
 | `bin_size_seconds` | `metadata.json` | `60` | Different bin sizes produce incompatible sequences |
 | `market_open_et` | `metadata.json` | `"09:30"` | Grid must start at same wall-clock time |
 | `date` | `metadata.json` | `"2025-02-03"` | Day-level pairing |
-| `normalization.strategy` | `metadata.json` | `"per_day_zscore"` | Normalization must be compatible (or both raw) |
+| `normalization.applied` | `metadata.json` | `false` (default) or `true` | Determines whether sequences are pre-normalized or raw. Trainer must read this flag and skip normalization if `applied = true`. |
 | `sequence.window_size` | `manifest.json` | `20` | Sequences must cover same number of bins |
 | `sequence.stride` | `manifest.json` | `1` | Same stride ensures 1:1 sequence alignment |
 
@@ -635,7 +635,7 @@ When adding off-exchange features to the pipeline contract, follow this checklis
 
 | File | Shape | Dtype | Unit | Description |
 |------|-------|-------|------|-------------|
-| `{day}_sequences.npy` | `[N, T, F]` | `float32` | normalized | Feature sequences. T = `window_size` (default 20). F = enabled features (up to 34). Normalized per-day z-score by default. |
+| `{day}_sequences.npy` | `[N, T, F]` | `float32` | raw or normalized | Feature sequences. T = `window_size` (default 20). F = always 34 (disabled groups produce zeros). **By default `normalization = "none"`**; the trainer applies its own per-day z-score downstream. When `normalization = "per_day_zscore"` is set in `[export]`, sequences are normalized at export time using the per-day Welford stats stored in `{day}_normalization.json`. |
 | `{day}_labels.npy` | `[N, H]` | `float64` | basis points | Point-to-point returns at each configured horizon. H = number of horizons (default 8: [1,2,3,5,10,20,30,60] bins). |
 | `{day}_forward_prices.npy` | `[N, max_H+1]` | `float64` | USD | Mid-price trajectory. Column 0 = base mid-price at time t. Columns 1..max_H = mid-price at t+1..t+max_H bins. |
 | `{day}_metadata.json` | -- | JSON | -- | Schema version, provenance, feature count, alignment metadata. |

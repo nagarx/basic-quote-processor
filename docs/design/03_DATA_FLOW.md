@@ -232,34 +232,52 @@ Every exported day includes a metadata JSON file with these required fields:
   "n_sequences": 342,
   "window_size": 20,
   "n_features": 34,
-  "bin_size_seconds": 60,
-  "market_open_et": "09:30",
-  "first_bin_offset": 0,
   "schema_version": "1.0",
   "contract_version": "off_exchange_1.0",
-  "label_type": "point_return",
+  "label_strategy": "point_return",
+  "label_encoding": "continuous_bps",
   "horizons": [1, 2, 3, 5, 10, 20, 30, 60],
-  "normalization": "per_day_zscore",
-  "signing_method": "midpoint",
-  "exclusion_band": 0.10,
-  "n_total_records": 285642,
-  "n_trade_records": 42381,
-  "n_trf_trades": 22105,
+  "bin_size_seconds": 60,
+  "market_open_et": "09:30",
+  "normalization": {
+    "strategy": "per_day_zscore",
+    "applied": false,
+    "params_file": "2025-06-15_normalization.json"
+  },
+  "provenance": {
+    "source_file": "xnas-basic-20250615.cmbp-1.dbn.zst",
+    "processor_version": "0.1.0",
+    "export_timestamp_utc": "2026-03-22T14:30:00Z"
+  },
+  "export_timestamp": "2026-03-22T14:30:00Z",
+  "first_bin_start_ns": 1718456400000000000,
+  "last_bin_end_ns": 1718479800000000000,
   "n_bins_total": 390,
   "n_bins_valid": 367,
   "n_bins_warmup_discarded": 3,
   "n_bins_label_truncated": 20,
+  "n_total_records": 285642,
+  "n_trade_records": 42381,
+  "n_trf_trades": 22105,
+  "n_lit_trades": 12500,
+  "data_source": "XNAS.BASIC",
+  "schema": "cmbp-1",
+  "symbol": "NVDA",
+  "equs_summary_available": true,
   "consolidated_volume": 45230000,
   "trf_volume_fraction": 0.489,
-  "provenance": {
-    "source_file": "xnas-basic-2025-06-15.cmbp-1.dbn.zst",
-    "equs_summary_file": "equs-summary-2025-06-15.ohlcv-1d.dbn.zst",
-    "config_file": "configs/nvda_60s.toml",
-    "processor_version": "0.1.0",
-    "export_timestamp": "2026-03-22T14:30:00Z"
-  }
+  "feature_groups_enabled": { "signed_flow": true, "venue_metrics": true, "retail_metrics": true, "bbo_dynamics": true, "vpin": false, "trade_size": true, "cross_venue": true },
+  "classification_config": { "exclusion_band": 0.10, "bjzz_lower": 0.001 },
+  "signing_method": "midpoint",
+  "exclusion_band": 0.10
 }
 ```
+
+> **Schema notes**: Field names match `src/export/metadata.rs` (`ExportMetadata` struct). Notably:
+> - `label_strategy` (NOT `label_type`) — matches the JSON serialization
+> - `normalization` is a nested object `{strategy, applied, params_file}` — not a bare string
+> - `provenance` contains `source_file`, `processor_version`, `export_timestamp_utc`, `config_hash` (optional)
+> - `consolidated_volume` and `trf_volume_fraction` are `Option<>` and are omitted (not `null`) when EQUS_SUMMARY is unavailable, via `#[serde(skip_serializing_if = "Option::is_none")]`
 
 ### 2.6 Bin Boundary Alignment
 
@@ -286,7 +304,7 @@ All timestamps are converted from UTC (wire format) to Eastern Time using DST-aw
 
 | Type | Size | Description |
 |------|------|-------------|
-| `CmbpRecord` | ~80B | Internal representation of a CMBP-1 record. Fields: `ts_event` (u64 ns UTC, from header), `ts_recv` (u64 ns UTC), `action` (u8), `side` (u8), `price` (i64 nanodollars), `size` (u32 shares), `bid_px` (i64), `bid_sz` (u32), `ask_px` (i64), `ask_sz` (u32), `publisher_id` (u16, from header). Converted from `dbn::CbboMsg` at the reader boundary. **Note**: The Rust `dbn::CbboMsg` uses `ConsolidatedBidAskPair` which has `bid_pb`/`ask_pb` (publisher IDs at the BBO level) but NOT `bid_ct`/`ask_ct` (order counts). Order counts are available in the Python Databento SDK but not exposed by the Rust dbn crate v0.20.0. No feature formulas depend on order counts. |
+| `CmbpRecord` | ~80B | Internal representation of a CMBP-1 record. Fields: `ts_event` (u64 ns UTC, from header), `ts_recv` (u64 ns UTC), `action` (u8: `b'T'` trade, `b'A'` quote), `side` (u8: `b'A'`/`b'B'`/`b'N'`), `flags` (u8 bitfield from `CbboMsg.flags.raw()` — used in Phase 2+ for TRF indicator detection), `price` (i64 nanodollars), `size` (u32 shares), `bid_px` (i64), `bid_sz` (u32), `ask_px` (i64), `ask_sz` (u32), `publisher_id` (u16, from header). Converted from `dbn::CbboMsg` at the reader boundary via `CmbpRecord::from_cbbo()` (field-by-field copy). **Note**: The Rust `dbn::CbboMsg` uses `ConsolidatedBidAskPair` which has `bid_pb`/`ask_pb` (publisher IDs at the BBO level) but NOT `bid_ct`/`ask_ct` (order counts). Order counts are available in the Python Databento SDK but not exposed by the Rust dbn crate v0.20.0. No feature formulas depend on order counts. |
 | `BboState` | ~56B | Current Nasdaq L1 BBO snapshot. Fields: `bid_price` (f64 USD), `bid_size` (u32 shares), `ask_price` (f64 USD), `ask_size` (u32 shares), `mid_price` (f64 USD, derived), `spread` (f64 USD, derived), `microprice` (f64 USD, derived), `last_update_ts` (u64 ns), `is_valid` (bool). Updated from every record's embedded BBO fields. Validity requires `spread > 0` and `is_finite(bid_price)` and `is_finite(ask_price)`. |
 | `ClassifiedTrade` | ~40B | A trade with signing and retail classification applied. Fields: `direction` (enum: Buy/Sell/Unsigned), `retail_status` (enum: Retail/Institutional/Unknown), `price` (f64 USD), `size` (u32 shares), `publisher_id` (u16), `ts_recv` (u64 ns). **Note**: `midpoint_at_trade` was removed — the accumulator reads midpoint directly from `BboState` (which is always updated before classification), avoiding redundant storage. |
 | `BinAccumulator` | ~512B | Per-bin accumulation state. Contains running sums and counters for: signed volume (buy/sell/unsigned), trade counts (total, TRF, lit, retail, institutional), size statistics (Welford accumulators for mean/variance), BBO snapshot at bin end, quote update count, spread sum for averaging, subpenny trade count, odd-lot count, block trade count (size >= threshold). Reset at every bin boundary. |
@@ -538,14 +556,14 @@ for each bin boundary:
 | Trading halt (not early close) | Halts typically last < 5 bins at 60s. Increase `close_detection_gap_bins` if halts cause false positives. At 10s bins, use a larger gap (e.g., 15). |
 | No records at all for a day | Day skipped entirely. Logged as warning. Not exported. |
 | Records only in pre-market (before 09:30 ET) | No bins emitted (all records fall before `market_open_et`). Day skipped. |
-| Very low activity day | May trigger false early-close. The `close_detection_gap_bins` default of 5 (= 5 minutes at 60s bins) is tuned to avoid this for NVDA, which has trades every few seconds during market hours. |
+| Very low activity day | May trigger false early-close. The `close_detection_gap_bins` default of 10 (= 10 minutes at 60s bins) is tuned to avoid this for NVDA and to absorb LULD halts (typically <5 min). |
 
 ### 6.4 Configuration
 
 ```toml
 [validation]
 auto_detect_close = true          # Enable/disable auto-detection
-close_detection_gap_bins = 5      # Consecutive empty bins to trigger close
+close_detection_gap_bins = 10     # Consecutive empty bins to trigger close (default: 10)
 ```
 
 If `auto_detect_close = false`, the pipeline always uses `market_close_et` (default 16:00 ET) as the session end.
@@ -752,8 +770,8 @@ The `dataset_manifest.json` at the top level contains:
   "window_size": 20,
   "n_features": 34,
   "horizons": [1, 2, 3, 5, 10, 20, 30, 60],
-  "label_type": "point_return",
-  "normalization": "per_day_zscore",
+  "label_strategy": "point_return",
+  "normalization": "none",
   "train_days": ["2025-02-03", "2025-02-04", "..."],
   "val_days": ["2025-10-01", "2025-10-02", "..."],
   "test_days": ["2025-11-14", "2025-11-17", "..."],

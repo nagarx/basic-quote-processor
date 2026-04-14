@@ -980,8 +980,8 @@ Per time bin:
 ```
 
 **Units**: Seconds
-**Range**: [0.0, ~23400.0] (capped at one trading session)
-**Data dependencies**: TRF trade timestamps, burst detection state
+**Range**: When no burst has been observed yet (warmup or genuinely no bursts), the value is exactly `warmup_bins * bin_size_seconds` (e.g., 3 × 60s = **180.0** with defaults). After the first burst, the value grows monotonically as `(bin_end_ts - last_burst_ts) / 1e9` until the next burst resets it. Not capped at a session length — if no further burst occurs, it grows linearly toward the end-of-session value (~23,400s in a full 6.5h session).
+**Data dependencies**: TRF trade timestamps, burst detection state (`BurstTracker.last_burst_ts`)
 
 **E9 validation**: Not directly tested. Derived from cross-venue interaction theory.
 
@@ -1363,9 +1363,9 @@ NPY export:           f32 (downcast at export boundary, with isfinite() check)
                       Forward prices: f64 (USD, no downcast)
 ```
 
-**Division guard**: `EPS = 1e-8` for all denominators.
-**Float comparison**: `FLOAT_CMP_EPS = 1e-10` for golden test comparisons.
-**NaN guard**: Every feature vector element is checked with `is_finite()` before NPY export. Any non-finite value is a hard error.
+**Division guard**: `EPS = 1e-8` (defined in `src/contract.rs`) for all denominators.
+**Float comparison in tests**: `1e-10` (inline literal) for golden test comparisons. Not a public constant in `src/contract.rs`.
+**NaN guard**: Every feature vector element is checked with `is_finite()` before NPY export. Any non-finite value is a hard error (`assert!` in `features/mod.rs:159`).
 
 ---
 
