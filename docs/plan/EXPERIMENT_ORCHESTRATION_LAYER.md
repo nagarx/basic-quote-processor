@@ -1365,6 +1365,16 @@ fn escape_non_ascii_in_json(raw: &str) -> String {
     out
 }
 
+// CanonicalError — error type referenced by canonical_json_dumps.
+// Round 15 B5 fix: was referenced but not defined in R14 commit of v1.3.1.
+#[derive(thiserror::Error, Debug)]
+pub enum CanonicalError {
+    #[error("non-finite number in JSON (NaN/Inf/-Inf)")]
+    NonFinite,
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+}
+
 // Test fixture 03_unicode.json verifies byte-equal with Python ensure_ascii=True:
 //   Input:  {"sym":"Ω"}
 //   Python: {"sym":"\u03a9"}
@@ -2126,10 +2136,27 @@ def rebuild(records_dir: Path, sqlite_path: Path) -> None:
     conn = sqlite3.connect(new_db)
     apply_schema(conn)
     for record_file in sorted(records_dir.glob('*.json')):
-        envelope = json.load(record_file.open())
+        raw = record_file.read_text()
         try:
-            insert_envelope(conn, envelope)
-        except SchemaViolation as e:
+            # Round 15 A2: rebuild MUST re-validate through Pydantic and use the
+            # SAME insert-helpers as §7.3. Otherwise the rebuilt
+            # training_info_json (etc.) serialization may diverge from the
+            # original at-ingest serialization — breaking §14.8's json_extract
+            # hash lookup. Do NOT bypass Pydantic by passing a raw dict.
+            validated = validate_envelope_v1(json.loads(raw))   # same path as §7.3
+            insert_experiment(conn, validated)                  # §7.3.1 INSERT template
+            insert_metrics(conn, validated)
+            insert_gates(conn, validated)
+            insert_artifacts(conn, validated)
+            insert_lineage(conn, validated)
+            insert_bulk_parquet_refs(conn, validated)
+            insert_tags(conn, validated)
+            cohort_hash = compute_cohort_hash(validated)
+            conn.execute(
+                "UPDATE experiments SET cohort_hash = ? WHERE experiment_fingerprint = ?",
+                (cohort_hash, validated.experiment_fingerprint),
+            )
+        except (ValidationError, SchemaViolation) as e:
             log.warn(f"Skip {record_file.name}: {e}")
     conn.commit()
     conn.close()
@@ -2137,6 +2164,8 @@ def rebuild(records_dir: Path, sqlite_path: Path) -> None:
 ```
 
 Rebuild does NOT regenerate Parquet files. If Parquet is missing, `artifacts`/`bulk_parquet_refs` rows still point to (missing) paths; `hft-ops ledger check` surfaces the inconsistency.
+
+**Round 15 A2 invariant**: rebuild re-runs the exact Pydantic validation + insert path used at ingest (§7.3). This is the ONLY way to guarantee `training_info_json`, `signal_provenance_json`, etc. are serialized with byte-identical canonical form on rebuild — which is what §14.8's `json_extract(training_info_json, '$.normalization_stats_sha256')` hash lookup depends on. A raw-dict-passthrough rebuild (prior pseudocode) could silently produce non-canonical JSON (e.g., different key order) → §14.8 lookup returns `None` → spurious `UpstreamNotYetIngestedError`. Tested by `test_fm_10_orphaned_record_heal_recovers` at §18.3.
 
 ### §5.7 Schema Migration Protocol (Round 13 — B6)
 
@@ -2221,6 +2250,7 @@ def apply_pending(conn: sqlite3.Connection) -> list[int]:
   - **Minor** (`1.0.0 → 1.1.0`): additive — new table, new NULLABLE column, new index. Backward-compat (old code reads new DB fine; missing columns returned as NULL).
   - **Major** (`1.0.0 → 2.0.0`): breaking — column rename, column type change, DROP column, tightened CHECK constraint, NOT NULL on existing nullable column, new required enum value. Old code FAILS against new DB.
 - **Atomic-commit rule** (Round 14 C6 — Agent C operational gap O7): every schema change MUST land in ONE commit: the TOML update (if envelope schema changes) + Python codegen output + Rust struct update + `NNN_*.sql` migration file. CI runs `verify_rust_envelope_schema.py` on every commit; a split-across-commits change is red until all pieces land. Enforcement: a pre-merge CI gate that requires either (a) none of `{pipeline_contract.toml, hft_contracts/orchestration/*, rust/orchestration/*, migrations/*.sql}` changed, OR (b) all four touched.
+- **Round 15 A8 — local dev workflow**: developers are NOT required to install a pre-commit hook for the atomic-commit gate. Workflow: operate on a feature branch, interim commits MAY be red on CI (commit-1 updates TOML only, commit-2 adds codegen output, etc.), the PRE-MERGE check (final commit before merge to main) MUST be green. Land-as-series to a feature branch is the expected pattern. Direct commits to main are forbidden by branch protection.
 
 **Test** (§18.2 Migration, 4 tests):
 - Fresh DB → `apply_pending` runs all migrations → `schema_migration_num` matches highest on disk.
@@ -2856,6 +2886,79 @@ VALUES (?, ?, ?, ?);
 ### §7.3.2 Helper Functions (Round 14 C5 — 9 primitives referenced by §7.3/§7.4/§14.8)
 
 The `ingest_one()` pseudocode at §7.3 references several helper primitives that are defined here. Each is a small utility (<20 LOC). Implementations live in `hft-ops/src/hft_ops/ledger/helpers.py` (Phase 11 W2 deliverable).
+
+**Trivial primitives referenced by the 9 helpers below** (Round 15 addition — filling micro-gaps in the R14 C5 spec):
+
+```python
+# Module-level constant: mirrors schema_info.schema_version; embedded in .error sidecars
+# for forensic version-stamping. Loaded once at module import via:
+#   SCHEMA_INFO_VERSION = _load_schema_info_version()
+# which reads pipeline_contract.toml → [contract].schema_version.
+SCHEMA_INFO_VERSION: str = "1.0.0"  # kept in sync with pipeline_contract.toml by codegen
+
+def _utc_now_iso_z() -> str:
+    """Current wall-clock time as ISO 8601 UTC with Z suffix (matches B1 regex).
+
+    Used by all sidecar writers (audit log, quarantine .error, pending .waiting).
+    Pydantic serializer _to_iso_z() at §15.1a Day 3 uses the same output format.
+    """
+    from datetime import datetime, timezone
+    dt = datetime.now(timezone.utc)
+    s = dt.strftime('%Y-%m-%dT%H:%M:%S')
+    if dt.microsecond:
+        s += f'.{dt.microsecond:06d}'.rstrip('0').rstrip('.') or ''
+    return s + 'Z'
+```
+
+**`IngestOneResult` class** (referenced by every `ingest_one` path; §7.3 calls 7 factory methods):
+
+```python
+from dataclasses import dataclass
+from typing import Optional, ClassVar
+from pathlib import Path
+
+@dataclass(frozen=True)
+class IngestOneResult:
+    """Outcome of a single envelope ingest attempt.
+
+    Immutable record of what happened; consumed by IngestReport for summary.
+    Constructor methods cover all terminal states in §7.3's ingest_one() flow.
+    """
+    outcome: str                # 'would_insert' | 'duplicate_idempotent' | 'duplicate_pk' |
+                                #  'inserted' | 'pending_upstream' | 'quarantined' | 'age_out_quarantined'
+    envelope_path: Optional[Path] = None
+    experiment_fingerprint: Optional[str] = None
+    experiment_id: Optional[str] = None
+    reason: Optional[str] = None          # for quarantined / pending / age-out
+    missing_fingerprints: Optional[tuple] = None  # for pending_upstream
+
+    # Factory methods (used throughout §7.3 / §7.4)
+    @classmethod
+    def would_insert(cls, v: "Envelope") -> "IngestOneResult":
+        return cls(outcome='would_insert', experiment_fingerprint=v.experiment_fingerprint, experiment_id=v.experiment_id)
+    @classmethod
+    def duplicate_idempotent(cls, v: "Envelope") -> "IngestOneResult":
+        return cls(outcome='duplicate_idempotent', experiment_fingerprint=v.experiment_fingerprint, experiment_id=v.experiment_id)
+    @classmethod
+    def duplicate_pk(cls, v: "Envelope") -> "IngestOneResult":
+        return cls(outcome='duplicate_pk', experiment_fingerprint=v.experiment_fingerprint, experiment_id=v.experiment_id)
+    @classmethod
+    def inserted(cls, v: "Envelope") -> "IngestOneResult":
+        return cls(outcome='inserted', experiment_fingerprint=v.experiment_fingerprint, experiment_id=v.experiment_id)
+    @classmethod
+    def pending_upstream(cls, v: "Envelope", reason: str) -> "IngestOneResult":
+        return cls(outcome='pending_upstream', experiment_fingerprint=v.experiment_fingerprint,
+                   experiment_id=v.experiment_id, reason=reason)
+    @classmethod
+    def quarantined(cls, envelope_path: Path, reason: str) -> "IngestOneResult":
+        return cls(outcome='quarantined', envelope_path=envelope_path, reason=reason)
+    @classmethod
+    def age_out_quarantined(cls, envelope_path: Path) -> "IngestOneResult":
+        return cls(outcome='age_out_quarantined', envelope_path=envelope_path,
+                   reason='upstream never arrived; aged out after 24h')
+```
+
+**The 9 core helpers (unchanged from v1.3.1 — listed here for reference):**
 
 **`atomic_write_text(path: Path, content: str) -> None`** — atomic file write via tmp+fsync+replace. Used for `records/{id}.json` writes (canonical form). The same primitive supports `.error`, `.waiting`, and `.migration_state` sidecar files.
 
@@ -4064,6 +4167,7 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 - **Inbox path resolution** (§7.1a): `HFT_OPS_LEDGER_INBOX` env var + `--ledger-inbox` CLI arg + orchestrated-fail-fast / standalone-warn fallback.
 - **`pending/` directory** for out-of-order ingest (§14.8 / D4): `UpstreamNotYetIngestedError` routes to pending/; `ingest_all` retries pending/ first; 24h age-out to quarantine.
 - CLI: `hft-ops ledger {ingest, query, show, compare, diff, list, rebuild, check, backup, quarantine, audit-log, note, tag, render-indexes, pending}`.
+- **Round 15 A11**: `hft-ops sweep fingerprints --verify [--configs-dir <path>] [--batch N] [--strict]` CLI (~30 LOC) — walks each trainer config in `lob-model-trainer/configs/`, resolves `_base:` chain via `resolve_inheritance()`, hashes the resolved-effective dict with the Phase 3 algorithm (`dedup.py:284-391`), compares against pre-recorded per-config fingerprints stored in `hft-ops/ledger/fingerprint_baselines.json`. Reports drift. Invoked by §13.3 weekly Phase 3.5 coordination gate. Phase 11 Week 2 scope (~4h implementation).
 - Python SDK: `Ledger` class + helpers; optional `pandas` passthrough.
 - Migration CLI: 4-step backfill of 34 retroactive records (§13.1).
 - **Legacy → envelope-v0 field mapping** (§13.1b) with tests that migrate 34/34 records with byte-identical fingerprint preservation.
@@ -4107,6 +4211,7 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 - Add `[orchestration.gate_keys]` with 9 keys as native TOML tables (§4.5 — same).
 - Add `[orchestration.feature_schemas.equity_v2_2]`, `[orchestration.feature_schemas.off_exchange_1_0]` declarations with fields `total_count`, `layout`, `source_toml_section` (e.g., `"[features]"` or `"[features.off_exchange]"`).
 - Verify: `tomllib.loads(pipeline_contract.toml)` produces a valid `orchestration.*` tree AND `json.loads(orchestration.envelope.json_schema)` produces a valid Draft-07 schema.
+- **Round 15 A5 — TOML literal-string escape guard**: before committing Day 1 TOML changes, run `grep -c "'''" pipeline_contract.toml` and assert the count is even AND that no `'''` appears between the opening and closing literal-string delimiters of the `json_schema` field. TOML literal multiline strings cannot contain `'''` in their body — this would silently close the string early. Automated check: a small Python snippet in CI that parses the TOML and verifies the extracted `json_schema` string round-trips through `json.loads()` without truncation.
 - Gate: schema is frozen. Restart protocol: if Day 3+ discovers a schema gap, `git reset --hard` to pre-Day-1 commit and redo Days 1-2. Each Day is its own commit on the `phase-11-w1` branch; restart = branch delete + recreate.
 
 **Day 2 — Python codegen extension + dependency strategy**:
@@ -4133,6 +4238,8 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
   from .upstream import resolve_upstream_ref, UpstreamRef  # noqa: E402
   ```
 - Extend `contracts/generate_python_contract.py` to emit `hft_contracts/orchestration/envelope.py` (Pydantic v2 model), `metric_keys.py` (enum), `gate_keys.py` (enum) from the TOML. The existing single-output-file pattern becomes multi-output — refactor `OUTPUT_PATH` into a dict keyed by generator name.
+- **Round 15 B9 — Pydantic sub-model naming convention**: codegen emits one `BaseModel` subclass per nested object declared in §3.2, named in TitleCase with singular form for array items: `LineageEntry`, `ArtifactEntry`, `MetricEntry`, `GateEntry`, `BulkParquetEntry`, `ExportStats`, `TrainingInfo`, `StrategyInfo`, `SignalProvenance`, `GitInfo`. Required so the C4 `@field_serializer('override_at')` on `GateEntry` and the C4 `@field_serializer('created_at', 'finalized_at', 'heartbeat_at')` on `Envelope` attach at the correct class. `sub_records` stays `List[Dict[str, Any]]` (§3.2 declares items as opaque `{type: object}` with no properties — no nested Pydantic needed).
+- **Round 15 A9 — hft-ops transitive dependency**: hft-ops consumes `hft_contracts.orchestration` (envelope validation, canonical JSON, etc.), so `hft-ops/pyproject.toml` MUST declare its hft-contracts dependency with the `orchestration` extra: `hft-contracts[orchestration]>=X.Y.Z` (NOT bare `hft-contracts`). Any consumer of hft-ops installing it via `pip install hft-ops` thus gets Pydantic transitively. Same applies to lob-model-trainer and lob-backtester's pyproject.toml when they start emitting envelopes (Week 4). Verify during Week 2 pyproject updates.
 - Also hand-write `hft_contracts/orchestration/canonical_json.py` (not codegen'd — it's a utility, not derived from TOML).
 - Run `python contracts/generate_python_contract.py` → verify 3 output files parse as Python.
 - `pip install -e .[orchestration] && python -c "from hft_contracts.orchestration import Envelope"` succeeds.
@@ -4190,6 +4297,10 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 - **Week 1 exit gate**: `test_rust_envelope_serialization_matches_python_golden` AND `test_schema_hash_verify_catches_toml_drift` both pass. If parity fails, STOP: defer all Rust work to Phase 11.5 and re-plan Weeks 2-4 without Rust dependencies.
 
 **Week 1 total scope** (Round 14 revised): ~54-76 hours of focused work. At 50h/wk this is ~1.1-1.5 calendar weeks. The original §15.1 "8-10 weeks" budget absorbs a 1.5-week Week-1 without endangering later milestones.
+
+**Round 15 B7 — explicit scope boundary**: Week 1 delivers the **envelope contract plane only** (TOML → Python Pydantic + enums + canonical JSON + Rust struct + parity test). The SQLite DDL (§5.3), migration file `001_initial_v1_0_0.sql`, and ledger runtime (`hft_ops.ledger.*` Python module) are **Week 2 scope**. Week 1 exit gate depends ONLY on envelope+codegen+parity — NOT on SQLite being functional. This boundary prevents scope creep from pulling Week-2 plumbing into Week 1.
+
+**Round 15 B4 — fixture canonicalization convention**: when producing Day 4 derived fixtures by hand-editing the golden, the workflow is: (a) edit file as desired, (b) run through `Envelope.model_validate_json(text).model_dump(mode='json', exclude_none=False)`, (c) feed to `canonical_json_dumps()`, (d) write THAT output — not the raw hand-edit — as the final fixture. The `expected_sha256.json` hashes are computed from step (d) output. This guarantees every fixture is canonical-form regardless of hand-editing drift.
 
 ### §15.2 Phase 12: Sweep v2 + Parallel Execution (2 weeks)
 
@@ -4417,6 +4528,29 @@ hft-ops/tests/fixtures/ledger/
 - Symlinks are relative paths (`../../../hft-contracts/tests/fixtures/...`) so they survive `git clone`, sibling-directory moves, and worktree-based development. `git` stores symlinks as content mode 120000; no special handling needed.
 
 **Rust-side consumption**: the Rust crate at `hft-contracts/rust/` consumes `hft-contracts/tests/fixtures/envelopes/golden/*.json` DIRECTLY (no symlinks needed — same repo). Rust `#[test]` functions use `include_str!("../tests/fixtures/envelopes/golden/01_complete.json")` or filesystem-relative `Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/...")`.
+
+**Round 15 A10 — fixture resolution for pip-installed consumers**: the symlink mechanism above assumes the consumer runs tests from a working directory within the monorepo layout (sibling `hft-contracts/` directory accessible). This is true for monorepo-internal dev (`cd hft-ops && pytest`) but BREAKS when a CI job pip-installs `hft-contracts` from the standalone GitHub repo (the installed wheel has no symlink target). Resolution:
+
+1. **`hft-contracts/pyproject.toml` declares `package_data`** so fixtures ship with the wheel:
+   ```toml
+   [tool.setuptools.package-data]
+   "hft_contracts" = ["py.typed", "tests/fixtures/**/*.json", "tests/fixtures/**/*.toml"]
+   ```
+2. **Fixture resolution API** in `hft_contracts.orchestration.fixtures`:
+   ```python
+   from importlib.resources import files
+   def fixture_path(rel: str) -> Path:
+       """Resolve a fixture path, preferring importlib.resources (works for pip-install)
+       and falling back to filesystem walk-up for monorepo dev."""
+       try:
+           return Path(str(files("hft_contracts") / "tests" / "fixtures" / rel))
+       except (ModuleNotFoundError, FileNotFoundError):
+           # Dev-mode fallback: walk up from caller
+           return Path(__file__).parent.parent.parent / "tests" / "fixtures" / rel
+   ```
+3. **hft-ops test code** uses `fixture_path()` instead of hardcoded symlinked paths. Symlinks remain as dev-only convenience (they survive `git clone` inside the monorepo but are NOT the canonical resolution mechanism).
+
+Tests `test_fixture_resolution_via_importlib` (pip-install context) + `test_fixture_resolution_via_filesystem` (monorepo context) covered under §18.2 new test category.
 
 ### §18.2 Test Categories
 
@@ -4680,6 +4814,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | Draft v1.2 — Round 11 | 2026-04-15 | Applied Round 11 Tier-1 findings (4 parallel agents: radical alternatives / data-flow integrity / 5-year decay / code-reality alignment). All 7 Tier-1 items fixed. See Round 11 Tier-1 Amendments below. |
 | Draft v1.3 — Round 12/13 | 2026-04-15 | Applied Round 12 pre-implementation validation (3 agents: sequencing, cross-phase integration, implementation-surface) + Round 13 self-stress-test refinements. Added 8 blockers (B1-B8) + 4 decision amendments (D1-D4). See Round 12/13 Amendments below. |
 | Draft v1.3.1 — Round 14 | 2026-04-15 | Applied Round 14 validation (3 agents: v1.3 adversarial audit, Week-1 implementer dry-run, 3-month production-pilot stress-test). 9 critical fixes C1-C9 applied; 6 operational gaps documented as Phase 11 W2-3 additions. See Round 14 Amendments below. |
+| Draft v1.3.2 — Round 15 | 2026-04-15 | Applied Round 15 validation (2 agents: post-v1.3.1 amendment stress-test, Day-1 GO/NO-GO gate + self-check). 13 micro-fixes: A2 rebuild Pydantic-roundtrip parity; A5 TOML `'''` escape guard; A8 local-dev workflow UX; A9 hft-ops transitive dep; A10 `importlib.resources` fallback for pip-install CI; A11 `sweep fingerprints --verify` CLI added to deliverables; B4 fixture canonicalization workflow; B5 `CanonicalError` enum defined in §3.3.6; B7 Week 1 scope boundary (SQLite is Week 2); B9 Pydantic sub-model naming convention; self-check `SCHEMA_INFO_VERSION` + `_utc_now_iso_z` + `IngestOneResult` class. **Day 1 coding GREEN-LIT.** |
 
 ### Round 10 Amendments (v1 → v1.1)
 
