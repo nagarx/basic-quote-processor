@@ -1628,9 +1628,21 @@ optimization_execution_alignment = { description = "Training objective measures 
 label_exec_alignment_gt_0_5 = { description = "Label-to-execution correlation > 0.5 (P0 validation)" }
 sign_flip_rate_lt_0_5 = { description = "Feature sign-flip rate < 50% across CV folds" }
 bh_fdr_significant = { description = "Feature survives Benjamini-Hochberg FDR correction" }
+
+# Evaluator selection-criteria gates (Round 17 I10 — used by record_type='evaluation' envelopes)
+# Phase 4 Batch 4a `SelectionCriteria` fields → envelope.gates[] entries (not a separate
+# selection_criteria[] array; reuses the existing gates[] schema for consistency).
+# A `record_type='evaluation'` envelope populates one gate per criterion with:
+#   gate_name    = one of the keys below
+#   threshold    = the criterion's threshold value (e.g., min_ic = 0.05)
+#   observed     = the realized statistic on the evaluation split
+#   status       = 'passed' if criterion satisfied, 'failed' otherwise
+selection_min_ic = { description = "Evaluator SelectionCriteria.min_ic threshold: feature IC >= threshold" }
+selection_min_abs_ic = { description = "Evaluator SelectionCriteria.min_abs_ic threshold: |IC| >= threshold" }
+selection_require_holdout_confirmed = { description = "Evaluator SelectionCriteria.require_holdout_confirmed: holdout split confirms training-split signal (boolean; threshold=1, observed=1/0)" }
 ```
 
-Gate enum allows hft-rules §13 enforcement to be SCHEMA-BACKED, not documentation-only.
+Gate enum allows hft-rules §13 enforcement to be SCHEMA-BACKED, not documentation-only. **Round 17 I10 decision**: evaluator `SelectionCriteria` (Phase 4 Batch 4a) fields reuse the `gates[]` schema rather than introducing a separate `selection_criteria[]` envelope array — one concept, consistent validation path, no new JSON Schema property.
 
 ### §4.6 Markdown Render Throttle (Round 10 — Agent D R3)
 
@@ -3260,6 +3272,7 @@ Each rule is a single-line predicate on the validated envelope object (`e`). If 
 9. `e.symbols_json is None` XOR `e.symbol in json.loads(e.symbols_json)` — primary symbol consistency for multi-symbol runs.
 10. `e.training_info.normalization_stats_sha256 is not None` ⇔ `e.training_info.normalization_method in ("hybrid","global_zscore","per_feature_minmax")` — stats-hash required when a non-trivial normalization is declared (§BQ3 / §T2).
 11. `e.sub_records == []` unless `e.record_type == "sweep_aggregate"` — non-aggregate envelopes cannot carry sub-records.
+12. **Round 17 I4**: for `e.record_type == "export"`, if `e.artifacts[]` contains an entry with `kind == "metadata"` pointing to a readable `{day}_metadata.json`, the ingester invokes `hft_contracts.validation.validate_any_export_contract(json.load(artifact.path))`. On `ContractError` from the existing SSoT validator: **WARN-only in v1.0.0** (some legacy records lack metadata artifacts and still must ingest); promoted to **HARD-FAIL in v2.0.0** envelope schema bump. Gains free reuse of the existing 165+ validation tests covering SCHEMA_VERSION / feature count / normalization flag / provenance fields — no re-implementation in the ingest path.
 
 #### §7.6.2 Warn-only cross-field validations
 
@@ -3989,6 +4002,35 @@ For each of the 34 legacy records:
 7. Re-render `EXPERIMENT_INDEX.md` section for each legacy experiment; fuzzy-match against the hand-written entry in `lob-model-trainer/EXPERIMENT_INDEX.md` (field coverage, key metrics, gate results — not byte-identical).
 8. Verify §14.8 / §14.9 integrity gates DO NOT fire (exempted by producer="legacy-migrator").
 9. Property test: replaying the migration twice is idempotent (inbox→records→SQLite path unchanged on second run).
+
+### §13.1c Phase 4 Batch 4c.3 / 4c.4 Coordination (Round 17 I2 + I3)
+
+**Pending couplings that affect Phase 10 fingerprint + field-mapping invariants:**
+
+**Batch 4c.3 (fingerprint hook) cutover** — `hft-ops/src/hft_ops/ledger/dedup.py:352-373` currently passes `feature_set` / `feature_preset` through UNRESOLVED into `components["training"]` for the Phase 3 canonical-JSON hash. When Batch 4c.3 wires `feature_set → sorted feature_indices` resolution BEFORE the hash (per PA §3097), **every live record whose `training_config.data.feature_set` was set pre-4c.3 will silently change fingerprint** on the cutover.
+
+§13.1 success criterion #2 ("byte-identical fingerprint preservation") protects ONLY the 34 retroactive records (none of which use `feature_set`), NOT live records produced between Batch 4b ship (2026-04-15) and Batch 4c.3 ship. Phase 11 ingest reuses `compute_fingerprint` verbatim (§6.1) — so the cutover impacts it.
+
+**Required coordination**:
+1. Before Batch 4c.3 merges, enumerate affected live records via:
+   ```sql
+   SELECT experiment_fingerprint, experiment_id
+   FROM experiments
+   WHERE json_extract(config_source, '$.data.feature_set') IS NOT NULL;
+   ```
+2. For each affected row, compute the new fingerprint (post-4c.3 algorithm) and write an entry into `fingerprint_history(experiment_id, fingerprint_version, fingerprint_value, computed_at)` per §5.3. Set `fingerprint_version = 2` (algorithm bump per §6.5).
+3. Update `experiments.experiment_fingerprint` to the new value (the PK changes — drop and re-INSERT; CASCADE FKs follow).
+4. This IS a `compute_fingerprint` algorithm version bump — follows the §6.5 version-bump protocol. Add an RFC doc to `docs/plan/` describing the rationale.
+
+**Batch 4c.4 (provenance plumbing) cutover** — Batch 4c.4 (PA §3098) adds `feature_set_ref` as the **26th field** to `ExperimentRecord`. §13.1b's current mapping table enumerates 25 fields (Round 11 ground-truth). When 4c.4 lands:
+
+- §13.1b must gain a row #26: `feature_set_ref: {name, content_hash} | None` →
+  - OPTION A (minimal): `.metadata_json.legacy_feature_set_ref` (escape hatch; preserves the value without a typed envelope slot)
+  - OPTION B (typed): new top-level envelope field `feature_set_ref: Optional[FeatureSetRef]` (adds a Pydantic sub-model `FeatureSetRef(BaseModel): name: str; content_hash: str`; requires envelope_schema_version bump to `1.1.0`)
+
+Recommend OPTION A for Batch 4c.4 ship; OPTION B deferred to Phase 11.5 if typed lineage becomes useful. Coordination: the PR that adds Batch 4c.4's `ExperimentRecord.feature_set_ref` MUST also (a) amend §13.1b to row #26, (b) update the `legacy_to_envelope_v1` migrator to route the new field, (c) add a test in `hft-ops/tests/test_legacy_migration.py` asserting the new field round-trips. Track in `gentle-brewing-quail.md` pending items.
+
+**Gate**: Phase 11 ingest coding (Week 2) SHOULD NOT begin the `legacy_to_envelope_v1` migrator until Batch 4c.4's `feature_set_ref` status is decided (landed OR deferred). If deferred, migrator uses the current 25-field table verbatim. If landed, migrator pulls row #26 from the amended §13.1b.
 
 ### §13.2 Markdown Ledger Extraction
 
@@ -4863,6 +4905,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | Draft v1.3.1 — Round 14 | 2026-04-15 | Applied Round 14 validation (3 agents: v1.3 adversarial audit, Week-1 implementer dry-run, 3-month production-pilot stress-test). 9 critical fixes C1-C9 applied; 6 operational gaps documented as Phase 11 W2-3 additions. See Round 14 Amendments below. |
 | Draft v1.3.2 — Round 15 | 2026-04-15 | Applied Round 15 validation (2 agents: post-v1.3.1 amendment stress-test, Day-1 GO/NO-GO gate + self-check). 13 micro-fixes: A2 rebuild Pydantic-roundtrip parity; A5 TOML `'''` escape guard; A8 local-dev workflow UX; A9 hft-ops transitive dep; A10 `importlib.resources` fallback for pip-install CI; A11 `sweep fingerprints --verify` CLI added to deliverables; B4 fixture canonicalization workflow; B5 `CanonicalError` enum defined in §3.3.6; B7 Week 1 scope boundary (SQLite is Week 2); B9 Pydantic sub-model naming convention; self-check `SCHEMA_INFO_VERSION` + `_utc_now_iso_z` + `IngestOneResult` class. **Day 1 coding GREEN-LIT.** |
 | Draft v1.3.3 — Round 16 | 2026-04-16 | **Critical SSoT correction after Day 1 verification**: every prior round specified a NEW `canonical_json_dumps` with compact separators + `allow_nan=False` for Phase 10. Day 1 verification against root CLAUDE.md + PIPELINE_ARCHITECTURE.md §2988/3024 revealed this violates the **frozen monorepo canonical form** at `hft_contracts/canonical_hash.py` (Phase 4 Batch 4c hardening, 2026-04-15). The SSoT uses DEFAULT separators (`", "` and `": "` — WITH spaces), DEFAULT `ensure_ascii=True`, default `allow_nan=True` with `sanitize=True` option. Per the frozen contract: "Compact-separator variants would produce different bytes and break existing fingerprints." Per PA §3024: "When adding a new hash/canonical-form primitive, always place it in `hft-contracts` first, then import; never re-implement." **Fix**: Phase 10 REUSES `hft_contracts.canonical_hash.canonical_json_blob` — no new Python module. §3.3.6 rewritten to delegate. Rust side mirrors Python's DEFAULT form (whitespace separators + ASCII escape + NaN→null sanitize). §15.1a Day 2 deliverable "hand-write canonical_json.py" DELETED. All call sites updated (§3.5, §7.3, §7.3.2 helpers, §14.8, §15.1a Day 3, §18.1b fixture description, Appendix A glossary). **Day 1 output (pipeline_contract.toml) unaffected** — it contains only schema data, no canonical-form references. Day 2 coding unblocked with corrected spec. |
+| Draft v1.3.4 — Round 17 | 2026-04-16 | Applied Round 17 Phase 4 × Phase 10 integration audit (one agent, focused on non-canonical_hash SSoT primitives). 6 gaps fixed (0 blockers). **I10 decision**: evaluator `SelectionCriteria` (Phase 4 Batch 4a) reuses `gates[]` with new `selection_min_ic` / `selection_min_abs_ic` / `selection_require_holdout_confirmed` keys added to `[orchestration.gate_keys]` registry — one concept, no new envelope field. **I4**: new §7.6.1 rule 12 — ingester invokes `hft_contracts.validation.validate_any_export_contract` for `record_type='export'` envelopes (WARN-only v1, HARD-FAIL v2). **I2+I3**: new §13.1c Phase 4 Batch 4c.3/4c.4 coordination — flags the Batch 4c.3 fingerprint cutover for live feature_set-using records (triggers §6.5 algorithm version bump) and pre-plans §13.1b row #26 (`feature_set_ref`) for Batch 4c.4. **I9**: DOCUMENTATION_INDEX.md:277 refresh from "v1.1 Round-10-refined, 3,616 lines" → current. **I8**: PA §14.2 + §14 diagram Phase 10 entry flagged for Phase 11 coding PR. Day 1 pipeline_contract.toml extended with 3 new selection gate keys. |
 
 ### Round 10 Amendments (v1 → v1.1)
 
