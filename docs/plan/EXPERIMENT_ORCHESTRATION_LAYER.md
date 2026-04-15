@@ -1272,26 +1272,28 @@ def canonical_json_dumps(obj) -> str:
 
 ```rust
 // hft_contracts_rs/src/canonical_json.rs
-// Cargo.toml: serde_json = { version = "1", features = ["preserve_order"] }  // NOT used here
 use serde::Serialize;
 use serde_json::{to_string, Value};
 
 pub fn canonical_json_dumps<T: Serialize>(value: &T) -> Result<String, CanonicalError> {
     // Serialize to an intermediate Value tree, then re-serialize with sorted keys.
-    // serde_json by default escapes non-ASCII and uses compact separators; matches
-    // Python's ensure_ascii=True + separators=(",", ":"). Sort keys via a custom
-    // walker because serde_json::to_string does not sort by default.
+    // serde_json::to_string produces compact form (no whitespace) matching Python's
+    // separators=(",",":") — BUT does NOT escape non-ASCII characters to \uXXXX.
+    // Python's ensure_ascii=True DOES emit \uXXXX for every non-ASCII code point.
+    // Round 14 C2 fix: explicit post-processing step escape_non_ascii_in_json() to
+    // match Python's output byte-for-byte. This was a latent spec bug until R14-B.
     let intermediate: Value = serde_json::to_value(value)?;
     let sorted = sort_keys_recursive(intermediate);
     // Reject NaN/Inf early (serde_json serializes to `null` by default — WRONG)
     reject_non_finite(&sorted)?;
-    Ok(to_string(&sorted)?)  // serde_json::to_string is compact + ASCII-escaped
+    let raw_utf8 = to_string(&sorted)?;       // compact JSON in UTF-8 (non-ASCII NOT escaped)
+    Ok(escape_non_ascii_in_json(&raw_utf8))   // post-process to match Python ensure_ascii=True
 }
 
 fn sort_keys_recursive(v: Value) -> Value {
     match v {
         Value::Object(m) => {
-            let mut sorted: std::collections::BTreeMap<String, Value> =
+            let sorted: std::collections::BTreeMap<String, Value> =
                 m.into_iter().map(|(k, v)| (k, sort_keys_recursive(v))).collect();
             Value::Object(sorted.into_iter().collect())
         }
@@ -1315,6 +1317,58 @@ fn reject_non_finite(v: &Value) -> Result<(), CanonicalError> {
         _ => Ok(()),
     }
 }
+
+/// Post-process a UTF-8 JSON string to escape every non-ASCII character as
+/// `\uXXXX` (or surrogate pair for supplementary code points per RFC 8259).
+/// This matches Python's `json.dumps(..., ensure_ascii=True)` output.
+///
+/// Walks the JSON output character-by-character, tracking whether we're inside
+/// a string literal (to avoid escaping chars that are already inside `\uXXXX`
+/// sequences — though those are pure ASCII so this tracking is for correctness,
+/// not for that specific case).
+fn escape_non_ascii_in_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for c in raw.chars() {
+        if !in_string {
+            // Not in a string literal: plain ASCII JSON structural chars only.
+            // serde_json never emits non-ASCII outside string literals.
+            if c == '"' { in_string = true; }
+            out.push(c);
+            continue;
+        }
+        // Inside a string literal.
+        if c == '"' && !prev_backslash {
+            in_string = false;
+            out.push(c);
+            prev_backslash = false;
+            continue;
+        }
+        prev_backslash = (c == '\\') && !prev_backslash;
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let code = c as u32;
+            if code <= 0xFFFF {
+                // BMP: single \uXXXX
+                out.push_str(&format!("\\u{:04x}", code));
+            } else {
+                // Supplementary plane: surrogate pair per RFC 8259 §7
+                let adjusted = code - 0x10000;
+                let high = 0xD800 + (adjusted >> 10);
+                let low  = 0xDC00 + (adjusted & 0x3FF);
+                out.push_str(&format!("\\u{:04x}\\u{:04x}", high, low));
+            }
+        }
+    }
+    out
+}
+
+// Test fixture 03_unicode.json verifies byte-equal with Python ensure_ascii=True:
+//   Input:  {"sym":"Ω"}
+//   Python: {"sym":"\u03a9"}
+//   Rust:   {"sym":"\u03a9"}   // matches ONLY with escape_non_ascii_in_json
 ```
 
 **Invariants (tested by cross-lang fixtures):**
@@ -1681,6 +1735,14 @@ CREATE TABLE IF NOT EXISTS schema_info (
 );
 INSERT OR IGNORE INTO schema_info (key, value) VALUES ('schema_version', '1.0.0');
 INSERT OR IGNORE INTO schema_info (key, value) VALUES ('envelope_version_max', '1');
+-- Round 14 C6: schema_migration_num bootstrap. MUST be set at DB-creation
+-- time (not only by the migration runner). Fresh DB initialized via the raw
+-- §5.3 DDL has `schema_migration_num='0'`; the first migration (001_initial)
+-- advances this to '1' idempotently via `INSERT OR REPLACE`. Without this
+-- row, `apply_pending()` sees `row is None` and re-runs migration 001 each
+-- time — which is harmless (CREATE TABLE IF NOT EXISTS + INSERT OR REPLACE
+-- are idempotent) but confusing.
+INSERT OR IGNORE INTO schema_info (key, value) VALUES ('schema_migration_num', '0');
 INSERT OR IGNORE INTO schema_info (key, value)
     VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));  -- ISO 8601 UTC
 
@@ -1762,7 +1824,19 @@ CREATE TABLE experiments (
     hypothesis                TEXT NOT NULL DEFAULT '',
     description               TEXT NOT NULL DEFAULT '',
 
-    -- Forward-compat
+    -- Nested envelope objects (Round 14 C1): stored as canonical JSON strings.
+    -- Separate columns (not folded into metadata_json) because these are TYPED
+    -- envelope fields with integrity invariants (e.g., §14.8 reads
+    -- training_info_json.normalization_stats_sha256). Queryable via SQLite's
+    -- json_extract(). NULL when the envelope doesn't carry the nested object
+    -- (e.g., export envelopes have no training_info).
+    training_info_json        TEXT,                          -- §3.2 training_info object (record_type='training')
+    signal_provenance_json    TEXT,                          -- §3.2 signal_provenance object (record_type='backtest')
+    strategy_info_json        TEXT,                          -- §3.2 strategy_info object (record_type='backtest')
+    export_stats_json         TEXT,                          -- §3.2 export_stats object (record_type='export')
+
+    -- Forward-compat (Round 14 disambiguation: this is producer-specific unknown-fields
+    -- catch-all; NOT for nested typed envelope objects above)
     metadata_json             TEXT NOT NULL DEFAULT '{}',
 
     -- Integrity
@@ -1782,6 +1856,11 @@ CREATE TABLE experiments (
 -- Indexes on experiments (PK is auto-indexed; do not redeclare).
 CREATE INDEX idx_experiments_id ON experiments(experiment_id);
 CREATE INDEX idx_experiments_cohort_hash ON experiments(cohort_hash) WHERE cohort_hash IS NOT NULL;
+-- Round 14 C1: functional index on training_info_json.normalization_stats_sha256
+-- for fast §14.8 integrity lookup. Partial index (only training-type rows).
+CREATE INDEX idx_experiments_training_norm_hash
+    ON experiments(json_extract(training_info_json, '$.normalization_stats_sha256'))
+    WHERE training_info_json IS NOT NULL;
 CREATE INDEX idx_experiments_symbol_class_created ON experiments(asset_class, symbol, created_at DESC);
 CREATE INDEX idx_experiments_model_family_label ON experiments(model_family, label_family, finalized_at DESC);
 CREATE INDEX idx_experiments_sampling ON experiments(sampling_strategy, primary_horizon);
@@ -2124,7 +2203,24 @@ def apply_pending(conn: sqlite3.Connection) -> list[int]:
     return applied
 ```
 
-**Semver pairing**: `schema_info.schema_version` (e.g., `"1.0.0"`) is the PUBLIC version; `schema_info.schema_migration_num` (integer) is the INTERNAL monotonic counter. Every migration file updates `schema_version` when appropriate (minor bumps for additive, major for breaking).
+**Semver pairing (Round 14 C6 — normative rules):**
+
+- `schema_info.schema_version` (semver string, e.g., `"1.0.0"`) is the PUBLIC version exposed to tooling + documentation.
+- `schema_info.schema_migration_num` (monotonic integer) is the INTERNAL counter the migration runner uses to skip-already-applied.
+- **Bootstrap**: on fresh DB, §5.3 DDL initializes BOTH `schema_version='1.0.0'` AND `schema_migration_num='0'`. Migration `001_initial_v1_0_0.sql` (which is a wrapper around §5.3 DDL) advances `schema_migration_num` to `'1'` idempotently — it can run before or after the raw DDL and either way converges.
+- **Every migration file MUST update BOTH keys as its LAST statements**:
+  ```sql
+  -- Migration body: CREATE TABLE / ALTER TABLE / CREATE INDEX / ...
+  ...
+  -- Required tail (Round 14 rule):
+  INSERT OR REPLACE INTO schema_info (key, value) VALUES ('schema_migration_num', '<NNN>');
+  INSERT OR REPLACE INTO schema_info (key, value) VALUES ('schema_version', '<semver>');
+  ```
+- **Semver bump rule**:
+  - **Patch** (`1.0.0 → 1.0.1`): non-functional change (fix typo in a CHECK constraint, add a docstring). RARE.
+  - **Minor** (`1.0.0 → 1.1.0`): additive — new table, new NULLABLE column, new index. Backward-compat (old code reads new DB fine; missing columns returned as NULL).
+  - **Major** (`1.0.0 → 2.0.0`): breaking — column rename, column type change, DROP column, tightened CHECK constraint, NOT NULL on existing nullable column, new required enum value. Old code FAILS against new DB.
+- **Atomic-commit rule** (Round 14 C6 — Agent C operational gap O7): every schema change MUST land in ONE commit: the TOML update (if envelope schema changes) + Python codegen output + Rust struct update + `NNN_*.sql` migration file. CI runs `verify_rust_envelope_schema.py` on every commit; a split-across-commits change is red until all pieces land. Enforcement: a pre-merge CI gate that requires either (a) none of `{pipeline_contract.toml, hft_contracts/orchestration/*, rust/orchestration/*, migrations/*.sql}` changed, OR (b) all four touched.
 
 **Test** (§18.2 Migration, 4 tests):
 - Fresh DB → `apply_pending` runs all migrations → `schema_migration_num` matches highest on disk.
@@ -2672,6 +2768,10 @@ Below are the **column orderings** that runtime generation must produce. Any dev
 
 ```sql
 -- insert_experiment: ONE row per envelope
+-- Round 14 C1: adds 4 nested-object JSON columns (training_info_json,
+-- signal_provenance_json, strategy_info_json, export_stats_json). Serialized
+-- from the Pydantic sub-models via canonical_json_dumps at ingest time;
+-- queryable via SQLite json_extract().
 INSERT INTO experiments (
     experiment_fingerprint, experiment_id, fingerprint_version,
     symbol, symbols_json, asset_class, cohort_hash,       -- cohort_hash set by post-insert UPDATE
@@ -2687,10 +2787,15 @@ INSERT INTO experiments (
     parent_id, upstream_ids,
     git_commit, git_branch, git_dirty,
     hypothesis, description,
+    training_info_json, signal_provenance_json,           -- §14.8 reads training_info_json
+    strategy_info_json, export_stats_json,                -- §3.2 record-type-specific blobs
     metadata_json,
     json_record_path, ingested_at
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
 -- cohort_hash initially NULL; set by post-insert UPDATE (same txn)
+-- Placeholder count: 48 (was 44 pre-v1.3.1 — add 4 for nested-object columns).
+-- The runtime build_insert_stmt (§7.3.1 B5) auto-derives this from the
+-- Pydantic field list; meta-test asserts placeholder count == DDL column count.
 
 -- insert_metrics: ZERO-OR-MORE rows per envelope
 INSERT INTO metrics (
@@ -2747,6 +2852,173 @@ VALUES (?, ?, ?, ?);
 1. Column order in the INSERT statement matches the field order in `ValidatedEnvelope` — this is a Contract: the Pydantic model's `.as_sql_row()` method returns a tuple aligned to these INSERTs.
 2. `sweep_id` FK is nullable in `experiments`; the `upsert_sweep` MUST run before `insert_experiment` if `sweep_id` is non-null.
 3. `notes` uses a separate API path (`ledger.add_note()` CLI) — envelopes do NOT carry `notes` on first ingest. The envelope's `.notes` top-level string field maps to the `description` column, NOT the `notes` table.
+
+### §7.3.2 Helper Functions (Round 14 C5 — 9 primitives referenced by §7.3/§7.4/§14.8)
+
+The `ingest_one()` pseudocode at §7.3 references several helper primitives that are defined here. Each is a small utility (<20 LOC). Implementations live in `hft-ops/src/hft_ops/ledger/helpers.py` (Phase 11 W2 deliverable).
+
+**`atomic_write_text(path: Path, content: str) -> None`** — atomic file write via tmp+fsync+replace. Used for `records/{id}.json` writes (canonical form). The same primitive supports `.error`, `.waiting`, and `.migration_state` sidecar files.
+
+```python
+def atomic_write_text(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)  # atomic POSIX rename
+```
+
+**`apply_pragmas(conn: sqlite3.Connection) -> None`** — applied once per connection. Reads §5.2 PRAGMAs verbatim.
+
+```python
+def apply_pragmas(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")  # 5s wait before SQLITE_BUSY
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-64000")  # 64 MiB page cache
+```
+
+**`audit_log_append(ledger_dir: Path, envelope: Envelope, result: str, duration_ms: int, note: str | None = None) -> None`** — appends ONE JSONL line to `hft-ops/ledger/ingest.log` using `O_APPEND` (atomic single-writer; `flock(ledger.lock)` is held by the caller).
+
+```python
+def audit_log_append(ledger_dir: Path, envelope: Envelope, *, result: str,
+                     duration_ms: int, note: str | None = None) -> None:
+    line = canonical_json_dumps({
+        "ingested_at": _utc_now_iso_z(),
+        "envelope_content_hash": sha256(canonical_json_dumps(envelope.model_dump(mode='json'))).hexdigest(),
+        "experiment_id": envelope.experiment_id,
+        "experiment_fingerprint": envelope.experiment_fingerprint,
+        "envelope_version": envelope.envelope_version,
+        "ingested_by": os.environ.get("USER", "unknown"),
+        "duration_ms": duration_ms,
+        "result": result,  # inserted | duplicate_idempotent | duplicate_pk | pending_upstream | rejected | error
+        "note": note,
+    })
+    log_path = ledger_dir / "ingest.log"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+```
+
+**`quarantine(envelope_path: Path, reason: str) -> IngestOneResult`** — atomic move to `quarantine/` + `.error` sidecar. Returns an IngestOneResult for the caller to surface.
+
+```python
+def quarantine(envelope_path: Path, reason: str) -> IngestOneResult:
+    ledger_dir = envelope_path.parent.parent  # inbox/ is directly under ledger_dir
+    q_dir = ledger_dir / "quarantine"
+    q_dir.mkdir(exist_ok=True)
+    q_path = q_dir / envelope_path.name
+    err_path = q_path.with_suffix(".error")
+    # Write .error sidecar FIRST (so an interrupted move doesn't leave a quarantined envelope without context)
+    atomic_write_text(err_path, canonical_json_dumps({
+        "reason": reason, "quarantined_at": _utc_now_iso_z(),
+        "original_path": str(envelope_path), "handler_version": SCHEMA_INFO_VERSION,
+    }))
+    os.replace(envelope_path, q_path)
+    audit_log_append(envelope_path.parent.parent, None, result="rejected", duration_ms=0, note=reason)
+    return IngestOneResult.quarantined(envelope_path, reason)
+```
+
+**`_escalate_pending_to_quarantine(pending_path: Path, ledger_dir: Path, reason: str) -> None`** — for `pending/` envelopes that aged out past 24h. Moves pending/file.json → quarantine/file.json with an `.error` sidecar containing both the original pending reason and the age-out reason.
+
+```python
+def _escalate_pending_to_quarantine(pending_path: Path, ledger_dir: Path, reason: str) -> None:
+    waiting_sidecar = pending_path.with_suffix(".waiting")
+    waiting_data = json.loads(waiting_sidecar.read_text()) if waiting_sidecar.exists() else {}
+    q_path = ledger_dir / "quarantine" / pending_path.name
+    err_path = q_path.with_suffix(".error")
+    atomic_write_text(err_path, canonical_json_dumps({
+        "reason": reason, "quarantined_at": _utc_now_iso_z(),
+        "previously_pending_for": waiting_data.get("waiting_since"),
+        "missing_fingerprints": waiting_data.get("missing_fingerprints", []),
+    }))
+    os.replace(pending_path, q_path)
+    if waiting_sidecar.exists():
+        waiting_sidecar.unlink()
+```
+
+**`_write_waiting_sidecar(pending_path: Path, missing_fingerprints: list[str]) -> None`** — writes a `.waiting` sidecar alongside a pending/ envelope. Format is documented contract (operators may `cat` these files to debug).
+
+```python
+def _write_waiting_sidecar(pending_path: Path, missing_fingerprints: list[str]) -> None:
+    sidecar = pending_path.with_suffix(".waiting")
+    atomic_write_text(sidecar, canonical_json_dumps({
+        "waiting_since": _utc_now_iso_z(),
+        "missing_fingerprints": sorted(missing_fingerprints),
+        "age_out_policy": "escalate_to_quarantine_after_24h",
+    }))
+```
+
+**`_extract_missing_fps(exc: UpstreamNotYetIngestedError, validated: Envelope) -> list[str]`** — extracts the list of missing fingerprints for the sidecar. Uses attribute access (preferred) + exception message fallback.
+
+```python
+def _extract_missing_fps(exc: UpstreamNotYetIngestedError, validated: Envelope) -> list[str]:
+    # Preferred: structured attribute set by raiser
+    if hasattr(exc, "missing_fingerprints"):
+        return exc.missing_fingerprints
+    # Fallback: derive from validated envelope's declared upstream
+    missing = []
+    if validated.signal_provenance and validated.signal_provenance.trainer_fingerprint:
+        missing.append(validated.signal_provenance.trainer_fingerprint)
+    for item in validated.lineage or []:
+        if item.source_kind in ("export", "trainer_run", "backtest_run") and item.source_hash:
+            missing.append(item.source_hash)
+    return missing
+```
+
+To support the preferred path, `UpstreamNotYetIngestedError.__init__` accepts a `missing_fingerprints` kwarg and stores it as an attribute.
+
+**`check_upstream_integrity(validated: Envelope, conn: sqlite3.Connection) -> None`** — §14.9 enforcement. Raises `UpstreamNotYetIngestedError` if any `lineage[].source_kind in {"export", "trainer_run", ...}` references a `source_hash` not in `experiments.experiment_fingerprint` OR `fingerprint_history.fingerprint_value`.
+
+```python
+def check_upstream_integrity(validated: Envelope, conn: sqlite3.Connection) -> None:
+    if validated.producer == "legacy-migrator":
+        return  # §13.1b exemption
+    LEDGER_KINDS = {"export", "trainer_run", "backtest_run", "evaluator_run"}
+    missing = []
+    for item in validated.lineage or []:
+        if item.source_kind not in LEDGER_KINDS:
+            continue
+        if not item.source_hash:
+            continue
+        # Check primary + historical fingerprints
+        row = conn.execute(
+            """SELECT 1 FROM experiments WHERE experiment_fingerprint = ?
+               UNION SELECT 1 FROM fingerprint_history WHERE fingerprint_value = ? LIMIT 1""",
+            (item.source_hash, item.source_hash)
+        ).fetchone()
+        if row is None:
+            missing.append(item.source_hash)
+    if missing:
+        raise UpstreamNotYetIngestedError(
+            f"{len(missing)} upstream lineage fingerprints not in ledger: {missing[:3]}...",
+            missing_fingerprints=missing,
+        )
+```
+
+Phase 11 deploys this as WARN-only initially (catch, log, proceed); Phase 13 promotes to hard-fail per §14.9.
+
+**`compute_cohort_hash(envelope: Envelope) -> str`** — §6.4 formula.
+
+```python
+def compute_cohort_hash(envelope: Envelope) -> str:
+    components = envelope.model_dump(mode='json', exclude_none=False)
+    # Drop fields that cross-symbol cohorts should share
+    for field in ("symbol", "symbols_json", "experiment_fingerprint", "experiment_id",
+                  "created_at", "finalized_at", "heartbeat_at", "ingested_at",
+                  "json_record_path", "git"):
+        components.pop(field, None)
+    # Drop data_manifest sub-field inside extraction_config if present
+    if "sampling_config" in components and isinstance(components["sampling_config"], dict):
+        components["sampling_config"].pop("data_manifest", None)
+    return sha256(canonical_json_dumps(components).encode("utf-8")).hexdigest()
+```
+
+All 9 helpers are pure-Python, stateless except as they touch the filesystem. They have unit tests in `hft-ops/tests/test_ingest_helpers.py` (~10-12 tests covering the happy path + 1-2 edge cases each).
 
 ### §7.4 Quarantine Protocol
 
@@ -3602,9 +3874,26 @@ The 36-config migration (Phase 3.5, 4 batches) is ORTHOGONAL to Phase 10 migrati
 
 - Phase 10 Step 1-2 can proceed in parallel with Phase 3.5.
 - Phase 10 Step 3 requires Phase 3.5 Batch 1 complete (all 5 E5 configs migrated to `_base:` multi-base).
+- **Round 13 (B3)**: gate widened from "Batch 1 only" to **"every Phase 11 Step-3 producer-rollout milestone must pass `hft-ops sweep fingerprints --verify` clean across ALL 4 Phase 3.5 batches."** Rationale: mid-Phase-11 migrations of Batches 2-4 mutate fingerprint inputs (a trainer config moves from legacy form to `_base:` form); if the resolved-config output of `resolve_inheritance` differs from the pre-migration serialization, the fingerprint changes and the ledger sees two distinct rows for what should be the same experiment.
 - Reason: Phase 10 Step 3 producers must compute fingerprints using `resolve_inheritance` — Phase 3.5 is what populates the bases.
 
-Coordination checkpoint: before Step 3, run `hft-ops sweep fingerprints --verify` on all 36 configs. If any fingerprint drift is detected, halt Step 3 until Phase 3.5 batch completes.
+**Coordination checkpoints (weekly, Phase 11 Weeks 1-10)**:
+
+```bash
+# Every Monday of Phase 11:
+hft-ops sweep fingerprints --verify --configs-dir lob-model-trainer/configs/
+# Expected: zero drift. Any drift halts producer rollout for that week.
+
+# Per-batch gate: before declaring a Phase 3.5 batch "complete", run:
+hft-ops sweep fingerprints --verify --batch {1,2,3,4} --strict
+# Halt if any config's resolved-form hash differs pre- vs post-migration.
+```
+
+**Incident protocol**: if fingerprint drift is detected mid-Phase-11:
+1. `fingerprint_history` captures both old and new hashes.
+2. Affected producers emit envelopes with the NEW fingerprint; the `fingerprint_history` JOIN preserves cross-version lookup.
+3. Phase 3.5 batch owner authors an RFC explaining the semantic divergence and either (a) commits the drift as intentional, or (b) rolls back the migration step.
+4. No producer rollout in the affected stage until the drift is resolved.
 
 ### §13.4 Rollback Plan
 
@@ -3694,8 +3983,11 @@ def check_normalization_integrity(validated: Envelope, conn: sqlite3.Connection)
         raise NormalizationStatsMismatchError("backtest missing signal_provenance.normalization_stats_sha256 despite non-'none' normalization_method")
 
     trainer_fp = validated.signal_provenance.trainer_fingerprint
+    # Round 14 C1: read training_info_json column directly (not metadata_json).
+    # The JSON blob is stored whole as canonical JSON; json_extract pulls the
+    # single hash field without full-blob Python parse.
     row = conn.execute(
-        "SELECT metadata_json FROM experiments WHERE experiment_fingerprint = ?",
+        "SELECT json_extract(training_info_json, '$.normalization_stats_sha256') FROM experiments WHERE experiment_fingerprint = ?",
         (trainer_fp,)
     ).fetchone()
     if row is None:
@@ -3703,8 +3995,7 @@ def check_normalization_integrity(validated: Envelope, conn: sqlite3.Connection)
         raise UpstreamNotYetIngestedError(
             f"trainer fingerprint {trainer_fp[:8]}... not yet in ledger; envelope will retry on next ingest call"
         )
-    trainer_meta = json.loads(row[0])
-    trainer_sha = trainer_meta.get("training_info", {}).get("normalization_stats_sha256")
+    trainer_sha = row[0]  # already the hash string or NULL via json_extract
     if trainer_sha != validated.signal_provenance.normalization_stats_sha256:
         # HARD failure: real hash mismatch — train/inference drift detected
         raise NormalizationStatsMismatchError(
@@ -3799,40 +4090,106 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 **Resolution**: day-by-day Week 1 order. Strict sequential dependencies.
 
 **Day 1 — Schema freeze in TOML** (resolves B1, D2, unblocks everything else):
-- Add `[orchestration.envelope]` section to `pipeline_contract.toml` with full v1 JSON Schema (52 top-level properties, including B1 Z-timezone regex patterns).
-- Add `[orchestration.metric_keys]` with 44 keys (§4.2 v1.2 registry already spec'd).
-- Add `[orchestration.gate_keys]` with 9 keys (§4.5).
-- Add `[orchestration.feature_schemas.equity_v2_2]`, `[orchestration.feature_schemas.off_exchange_1_0]` declarations (§4.4-ish extension).
-- Verify: `tomllib.loads(pipeline_contract.toml)` produces a valid `orchestration.*` tree.
-- Gate: schema is frozen; no changes this week without reset to Day 1.
+- Add `[orchestration.envelope]` section to `pipeline_contract.toml`. **Round 14 C3 decision**: the JSON Schema Draft-07 object (~450 lines) is stored as a single TOML **literal multiline string** (`'''...'''`), NOT as nested inline TOML tables. Rationale: JSON Schema uses `\uXXXX`, regex `\d`, etc. — embedding as TOML basic string `"""..."""` would require doubling every `\` to `\\`; TOML literal strings (`'''...'''`) take contents verbatim. Structure:
+  ```toml
+  [orchestration.envelope]
+  json_schema = '''
+  {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "required": [...],
+    "properties": { ... 52 properties ... }
+  }
+  '''
+  ```
+  Python loader: `json.loads(tomllib.load(f)['orchestration']['envelope']['json_schema'])`.
+- Add `[orchestration.metric_keys]` with 44 keys as native TOML tables (§4.2 v1.2 registry — KEEP native TOML form, no JSON encoding).
+- Add `[orchestration.gate_keys]` with 9 keys as native TOML tables (§4.5 — same).
+- Add `[orchestration.feature_schemas.equity_v2_2]`, `[orchestration.feature_schemas.off_exchange_1_0]` declarations with fields `total_count`, `layout`, `source_toml_section` (e.g., `"[features]"` or `"[features.off_exchange]"`).
+- Verify: `tomllib.loads(pipeline_contract.toml)` produces a valid `orchestration.*` tree AND `json.loads(orchestration.envelope.json_schema)` produces a valid Draft-07 schema.
+- Gate: schema is frozen. Restart protocol: if Day 3+ discovers a schema gap, `git reset --hard` to pre-Day-1 commit and redo Days 1-2. Each Day is its own commit on the `phase-11-w1` branch; restart = branch delete + recreate.
 
-**Day 2 — Python codegen extension**:
-- Extend `contracts/generate_python_contract.py` to emit `hft_contracts/orchestration/envelope.py` (Pydantic model), `metric_keys.py` (enum), `gate_keys.py` (enum) from the TOML.
-- Run `python contracts/generate_python_contract.py` → verify output files parse as Python.
-- `from hft_contracts.orchestration import Envelope; Envelope` succeeds.
+**Day 2 — Python codegen extension + dependency strategy**:
+- **Round 14 C7 decision**: Pydantic is declared as an OPTIONAL-dependency extra, NOT a hard dep. Update `hft-contracts/pyproject.toml`:
+  ```toml
+  [project.optional-dependencies]
+  generate = ["tomli>=2.0"]                           # existing
+  orchestration = ["pydantic>=2.0,<3.0"]              # NEW Round 14 C7
+  ```
+  The top-level `__init__.py` continues to work without pydantic. `hft_contracts.orchestration.*` guards imports:
+  ```python
+  # hft_contracts/orchestration/__init__.py
+  try:
+      from pydantic import BaseModel
+  except ImportError as e:
+      raise ImportError(
+          "hft_contracts.orchestration requires pydantic. "
+          "Install with: pip install hft-contracts[orchestration]"
+      ) from e
+  from .envelope import Envelope  # noqa: E402
+  from .metric_keys import MetricKey  # noqa: E402
+  from .gate_keys import GateKey  # noqa: E402
+  from .canonical_json import canonical_json_dumps  # noqa: E402
+  from .upstream import resolve_upstream_ref, UpstreamRef  # noqa: E402
+  ```
+- Extend `contracts/generate_python_contract.py` to emit `hft_contracts/orchestration/envelope.py` (Pydantic v2 model), `metric_keys.py` (enum), `gate_keys.py` (enum) from the TOML. The existing single-output-file pattern becomes multi-output — refactor `OUTPUT_PATH` into a dict keyed by generator name.
+- Also hand-write `hft_contracts/orchestration/canonical_json.py` (not codegen'd — it's a utility, not derived from TOML).
+- Run `python contracts/generate_python_contract.py` → verify 3 output files parse as Python.
+- `pip install -e .[orchestration] && python -c "from hft_contracts.orchestration import Envelope"` succeeds.
 
-**Day 3 — Hand-crafted golden fixture**:
-- By hand, construct ONE valid envelope JSON conforming to every §3.2 field (including nested `lineage[]`, `artifacts[]`, `bulk_parquet[]`, `metrics[]`, `gates[]`, `training_info`, `signal_provenance`).
+**Day 3 — Hand-crafted golden fixture + Pydantic Z-serializer**:
+- **Round 14 C4 decision**: Pydantic v2's `model_dump(mode='json')` emits datetimes as `+00:00` UTC offset — this FAILS the B1 regex requiring `Z` suffix. The codegen'd Pydantic model MUST declare `@field_serializer` methods on every timestamp field. Add to `envelope.py`:
+  ```python
+  from pydantic import BaseModel, field_serializer
+  from datetime import datetime
+  from typing import Optional
+
+  def _to_iso_z(dt: Optional[datetime]) -> Optional[str]:
+      if dt is None:
+          return None
+      s = dt.strftime('%Y-%m-%dT%H:%M:%S')
+      if dt.microsecond:
+          s += f'.{dt.microsecond:06d}'.rstrip('0').rstrip('.') or ''
+      return s + 'Z'
+
+  class Envelope(BaseModel):
+      created_at: datetime
+      finalized_at: Optional[datetime] = None
+      heartbeat_at: Optional[datetime] = None
+      # ... other fields
+
+      @field_serializer('created_at', 'finalized_at', 'heartbeat_at')
+      def _ser_z(self, v: Optional[datetime]) -> Optional[str]:
+          return _to_iso_z(v)
+  ```
+  Similar for `gates[].override_at` (via nested `GateEntry` sub-model's own `@field_serializer`).
+- By hand, construct ONE valid envelope JSON conforming to every §3.2 field (including nested `lineage[]`, `artifacts[]`, `bulk_parquet[]`, `metrics[]`, `gates[]`, `training_info`, `signal_provenance`, `strategy_info`, `export_stats`). Avoid `.parquet` paths that would require Parquet fixtures (use `bulk_parquet: []`).
 - Validate it: `Envelope.model_validate_json(sample.read_text())` must succeed.
 - Save to `hft-contracts/tests/fixtures/envelopes/golden/01_complete.json`.
-- Compute canonical form: `canonical_json_dumps(Envelope.model_validate_json(sample).model_dump())` → save as `golden/01_complete_canonical.json`.
+- Compute canonical form:
+  ```python
+  env = Envelope.model_validate_json(sample.read_text())
+  canonical = canonical_json_dumps(env.model_dump(mode='json', exclude_none=False))
+  (golden_dir / '01_complete_canonical.json').write_text(canonical)
+  ```
 - These TWO files become the cross-lang parity ground truth for Day 5.
 
 **Day 4 — Parameterize remaining fixtures**:
-- Generate 5 more fixtures derived from the canonical golden: `02_minimal_required.json` (only required fields), `03_multi_symbol.json` (symbols_json set), `04_missing_optional.json` (null-valued optionals), `05_legacy_migrator.json` (producer=legacy-migrator with `normalization_*` NULL), `06_pending_upstream.json` (backtest with valid upstream_fingerprint but trainer not-yet-ingested).
-- Plus 9 canonical_json fixtures: `01_simple.json` through `09_none_vs_null.json`.
-- Plus 7 invalid fixtures (§18.1b).
+- Generate 5 more envelope fixtures derived from the canonical golden (manual copy + edit, documented as "derived from 01_complete via field override"): `02_minimal_required.json` (only required fields), `03_multi_symbol.json` (symbols_json set), `04_missing_optional.json` (null-valued optionals), `05_legacy_migrator.json` (producer=legacy-migrator with `normalization_*` NULL), `06_pending_upstream.json` (backtest with valid upstream_fingerprint but trainer not-yet-ingested).
+- Plus 9 canonical_json test fixtures (NOT envelopes — raw JSON test cases for the canonical serializer): `01_simple.json` through `09_none_vs_null.json` per §3.3.6. Each accompanied by `expected_sha256.json` with pre-computed hashes.
+- Plus 7 invalid envelope fixtures (§18.1b) — one per representative §7.6.1 hard-fail rule.
 
 **Day 5 — Rust crate skeleton + parity test**:
-- Create `hft-contracts/Cargo.toml` + `hft-contracts/rust/lib.rs` + `rust/orchestration/envelope.rs` (hand-written struct mirroring the Pydantic model).
-- Add `SCHEMA_HASH` const (populated later).
-- Implement `canonical_json_dumps` in Rust (§3.3.6).
-- Write `rust/tests/envelope_golden.rs` that deserializes `golden/01_complete.json`, re-serializes, asserts byte-equal against `golden/01_complete_canonical.json`.
-- Run `cargo test -p hft_contracts_rs` — passes.
-- Run `contracts/verify_rust_envelope_schema.py` — computes TOML hash, writes `SCHEMA_HASH` const, commits.
-- **Week 1 exit gate**: both tests pass. If parity fails, STOP: defer all Rust work to Phase 11.5 and re-plan Weeks 2-4 without Rust dependencies.
+- Create `hft-contracts/Cargo.toml` (single `[package]` at repo root per §2.5.1 — NO workspace) + `hft-contracts/rust/lib.rs` + `rust/orchestration/mod.rs` + `rust/orchestration/envelope.rs` (hand-written struct mirroring the Pydantic model).
+- Declare dependencies in `Cargo.toml`: `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `sha2 = "0.10"`, `thiserror = "1"`. Set `publish = false`.
+- Implement `canonical_json_dumps` in Rust per §3.3.6 (WITH `escape_non_ascii_in_json` post-processor — Round 14 C2 fix).
+- Add `pub const SCHEMA_HASH: &str = "..."` in `rust/orchestration/schema_hash.rs` (separate file so the verifier script can rewrite it without disturbing the struct definition).
+- Write `rust/tests/envelope_golden.rs` that deserializes `tests/fixtures/envelopes/golden/01_complete.json`, re-serializes via `canonical_json_dumps`, asserts byte-equal against `golden/01_complete_canonical.json`.
+- Run `cargo test` (NOT `cargo test -p` — no workspace) — passes.
+- Run `contracts/verify_rust_envelope_schema.py` — computes TOML hash, writes `SCHEMA_HASH` const via regex-replace in `rust/orchestration/schema_hash.rs`, commits.
+- **Week 1 exit gate**: `test_rust_envelope_serialization_matches_python_golden` AND `test_schema_hash_verify_catches_toml_drift` both pass. If parity fails, STOP: defer all Rust work to Phase 11.5 and re-plan Weeks 2-4 without Rust dependencies.
 
-**Week 1 total scope**: ~40-50 hours of focused work (fits standard 40h/wk if no surprises; high confidence achievable).
+**Week 1 total scope** (Round 14 revised): ~54-76 hours of focused work. At 50h/wk this is ~1.1-1.5 calendar weeks. The original §15.1 "8-10 weeks" budget absorbs a 1.5-week Week-1 without endangering later milestones.
 
 ### §15.2 Phase 12: Sweep v2 + Parallel Execution (2 weeks)
 
@@ -3986,11 +4343,16 @@ Phase 11 deliverables:
 
 ### §18.1b Test Fixture Directory Layout
 
-Every test category below references fixtures under `hft-ops/tests/fixtures/ledger/` (unless otherwise noted). The layout is:
+**Round 14 C8 resolution**: fixtures live under `hft-contracts/tests/fixtures/` (single canonical location); `hft-ops/tests/fixtures/ledger/` consists of symlinks + hft-ops-specific fixtures. Rationale: cross-language parity fixtures (envelopes + canonical_json) must be readable by both Python and Rust; putting them in `hft-contracts/` (where both language suites live) avoids cross-repo path complexity.
+
+**Canonical layout** (shared Python + Rust):
 
 ```
-hft-ops/tests/fixtures/ledger/
+hft-contracts/tests/fixtures/
 ├── envelopes/
+│   ├── golden/                          # Round 14 C8 — cross-lang parity anchor
+│   │   ├── 01_complete.json             # hand-crafted; every §3.2 field populated
+│   │   └── 01_complete_canonical.json   # canonical_json_dumps output of the above
 │   ├── valid/                           # one per record_type, representative
 │   │   ├── v1_bqp_export.json
 │   │   ├── v1_mbo_export.json
@@ -3999,20 +4361,40 @@ hft-ops/tests/fixtures/ledger/
 │   │   ├── v1_evaluator_evaluation.json
 │   │   └── v1_sweep_aggregate.json
 │   ├── invalid/                         # one per failure mode §7.6 can catch
-│   │   ├── 01_bad_json.json             # syntactically invalid
-│   │   ├── 02_schema_violation.json     # missing required field
-│   │   ├── 03_enum_mismatch.json        # asset_class='stocks'
-│   │   ├── 04_cross_field_mismatch.json # n_horizons != len(horizons)
-│   │   ├── 05_fingerprint_malformed.json  # non-hex
-│   │   ├── 06_missing_artifact.json     # path references nonexistent file
-│   │   └── 07_oversized.json            # > 1 MB hard limit
-│   ├── legacy/                          # 34 legacy ExperimentRecord fixtures
-│   │   ├── hmhp_128feat_2026_03_13.json
-│   │   ├── tlob_regression_2026_03_15.json
-│   │   └── ...(32 more — one per legacy record)
+│   │   ├── 01_bad_json.json
+│   │   ├── 02_schema_violation.json
+│   │   ├── 03_enum_mismatch.json
+│   │   ├── 04_cross_field_mismatch.json
+│   │   ├── 05_fingerprint_malformed.json
+│   │   ├── 06_missing_artifact.json
+│   │   └── 07_oversized.json
 │   └── future/                          # envelope_version=2, 3, 99 for dispatch testing
 │       ├── v2_unknown.json
 │       └── v99_unknown.json
+└── canonical_json/                      # cross-lang fingerprint fixtures (§3.3.6)
+    ├── 01_simple.json
+    ├── 02_nested.json
+    ├── 03_unicode.json
+    ├── 04_float_int.json
+    ├── 05_nan_rejected.json
+    ├── 06_large_array.json
+    ├── 07_datetime_fallback.json        # Round 14 added
+    ├── 08_path_fallback.json            # Round 14 added
+    ├── 09_none_vs_null.json             # Round 14 added
+    └── expected_sha256.json             # hash of each above; checked by Py + Rust
+```
+
+**hft-ops-side layout** (ledger-specific, not cross-lang):
+
+```
+hft-ops/tests/fixtures/ledger/
+├── envelopes/                           # SYMLINK to ../../../hft-contracts/tests/fixtures/envelopes/
+│                                        #   (relative symlink survives git clone + moves)
+├── canonical_json/                      # SYMLINK to ../../../hft-contracts/tests/fixtures/canonical_json/
+├── legacy/                              # 34 legacy ExperimentRecord fixtures (hft-ops-specific)
+│   ├── hmhp_128feat_2026_03_13.json
+│   ├── tlob_regression_2026_03_15.json
+│   └── ...(32 more — one per legacy record)
 ├── ledgers/                             # pre-canned SQLite DBs for query/rebuild tests
 │   ├── empty.sqlite
 │   ├── one_experiment.sqlite
@@ -4022,26 +4404,19 @@ hft-ops/tests/fixtures/ledger/
 │   ├── training_curve_500epochs.parquet
 │   ├── feature_ic_148.parquet
 │   └── equity_curve_233days.parquet
-├── canonical_json/                      # cross-lang fingerprint fixtures (§3.3.6)
-│   ├── 01_simple.json
-│   ├── 02_nested.json
-│   ├── 03_unicode.json
-│   ├── 04_float_int.json
-│   ├── 05_nan_rejected.json
-│   ├── 06_large_array.json
-│   └── expected_sha256.json             # hash of each above; checked by Py + Rust
-└── golden/                              # migration + render golden outputs
-    ├── migrated_experiments.json        # expected post-migration experiments rows
-    ├── rendered_experiment_index.md     # expected EXPERIMENT_INDEX.md after render
+└── golden/                              # migration + render golden outputs (hft-ops-specific)
+    ├── migrated_experiments.json
+    ├── rendered_experiment_index.md
     └── rendered_backtest_index.md
 ```
 
 **Fixture conventions:**
 - All JSON fixtures are canonical form (§3.3.6) — no trailing newlines, sorted keys, ASCII-escaped.
 - `expected_sha256.json` maps fixture path → content hash; test failure if hash drifts (catches accidental fixture edits).
-- Parquet fixtures built via `tests/conftest.py::build_fixtures()` at session start (deterministic, reproducible from a seed).
+- Parquet fixtures built via `hft-ops/tests/conftest.py::build_fixtures()` at session start (deterministic, reproducible from a seed).
+- Symlinks are relative paths (`../../../hft-contracts/tests/fixtures/...`) so they survive `git clone`, sibling-directory moves, and worktree-based development. `git` stores symlinks as content mode 120000; no special handling needed.
 
-**Rust-side fixtures** (`hft-contracts` Rust crate, when available): symlinks to `hft-ops/tests/fixtures/ledger/canonical_json/` and `envelopes/valid/`. Rust tests assert `canonical_json_dumps` + `serde_json::from_str::<Envelope>()` produce bit-identical results to Python.
+**Rust-side consumption**: the Rust crate at `hft-contracts/rust/` consumes `hft-contracts/tests/fixtures/envelopes/golden/*.json` DIRECTLY (no symlinks needed — same repo). Rust `#[test]` functions use `include_str!("../tests/fixtures/envelopes/golden/01_complete.json")` or filesystem-relative `Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/...")`.
 
 ### §18.2 Test Categories
 
@@ -4304,6 +4679,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | Draft v1.1 — Round 10 | 2026-04-15 | Applied Round 10 validation findings (4 parallel agents: consistency / completeness / correctness / better-alternatives). See amended change list below. |
 | Draft v1.2 — Round 11 | 2026-04-15 | Applied Round 11 Tier-1 findings (4 parallel agents: radical alternatives / data-flow integrity / 5-year decay / code-reality alignment). All 7 Tier-1 items fixed. See Round 11 Tier-1 Amendments below. |
 | Draft v1.3 — Round 12/13 | 2026-04-15 | Applied Round 12 pre-implementation validation (3 agents: sequencing, cross-phase integration, implementation-surface) + Round 13 self-stress-test refinements. Added 8 blockers (B1-B8) + 4 decision amendments (D1-D4). See Round 12/13 Amendments below. |
+| Draft v1.3.1 — Round 14 | 2026-04-15 | Applied Round 14 validation (3 agents: v1.3 adversarial audit, Week-1 implementer dry-run, 3-month production-pilot stress-test). 9 critical fixes C1-C9 applied; 6 operational gaps documented as Phase 11 W2-3 additions. See Round 14 Amendments below. |
 
 ### Round 10 Amendments (v1 → v1.1)
 
@@ -4449,6 +4825,50 @@ Fixed throughout §1.1, §3.3, §6, §14, §19.
 - (C-FF7) `metadata_json.<producer>.*` namespace convention
 
 **Tier-3 items deferred (not blocking):** A6 summary/narrative split, C-SC2 bi-level Parquet partitioning (year-5), C-SC3 OPRA option fields (when OPRA ships), C-FF3 debounce-constants parameterization.
+
+### Round 14 Amendments (v1.3 → v1.3.1)
+
+**Agent verdicts (3 parallel agents):**
+- **R14-A** (v1.3 adversarial audit): 7 new inconsistencies + 3 gaps blocking Week 1. Primary finding: **§14.8 normalization integrity gate was un-implementable** because nested envelope objects (`training_info`, `signal_provenance`, `strategy_info`, `export_stats`) had no SQLite storage.
+- **R14-B** (Week 1 implementer dry-run): 9 ambiguities, realistic budget 54-76h vs spec's 36-40h. Primary finding: **Rust canonical JSON does NOT escape non-ASCII by default** — §3.3.6's claim was false; Day 5 parity test would fail on first unicode fixture.
+- **R14-C** (3-month production pilot): 6 operational gaps, 0 blockers. Primary findings: silent quarantine accumulation (no `ledger status` CLI); `ledger backup` covers SQLite only (contradicts §2.2 source-of-truth rule); `ingest.log` rotation unimplemented.
+
+**9 critical fixes (C1-C9) applied:**
+
+**C1 — Storage layer for nested envelope objects.** Added 4 new TEXT columns to `experiments` table: `training_info_json`, `signal_provenance_json`, `strategy_info_json`, `export_stats_json`. Serialized via `canonical_json_dumps(sub_model.model_dump())`. Queryable via SQLite `json_extract()`. Added partial index `idx_experiments_training_norm_hash` on `json_extract(training_info_json, '$.normalization_stats_sha256')`. Updated §14.8 query from `SELECT metadata_json` to `SELECT json_extract(training_info_json, '$.normalization_stats_sha256')` — single-field lookup instead of full-blob parse. Updated §7.3.1 INSERT template (placeholder count 44 → 48).
+
+**C2 — Rust canonical JSON non-ASCII escape.** Fixed §3.3.6's false claim that `serde_json` escapes non-ASCII. Added `escape_non_ascii_in_json()` post-processor that walks the serde_json output, tracks string-literal boundaries, escapes non-ASCII to `\uXXXX` (with surrogate pairs for supplementary code points per RFC 8259). Byte-matches Python's `json.dumps(..., ensure_ascii=True)`. Without this fix, Day 5 parity test fails on fixture `03_unicode.json`.
+
+**C3 — TOML encoding of the envelope JSON Schema.** §15.1a Day 1 now explicitly specifies: envelope schema is a TOML **literal multiline string** (`'''...'''`) containing raw JSON Schema Draft-07 text. MetricKey/GateKey remain native TOML tables (§4.2/§4.5). Rationale: TOML literal strings take content verbatim (no backslash escaping), so JSON's `\uXXXX` and regex `\d` embed cleanly. Python loader: `json.loads(tomllib.load(f)['orchestration']['envelope']['json_schema'])`.
+
+**C4 — Pydantic v2 Z-suffix serializer.** §15.1a Day 3 now specifies a `@field_serializer` on every datetime field in the codegen'd `Envelope` model. Pydantic v2's default `model_dump(mode='json')` emits `+00:00` offset — which FAILS the B1 Z-timezone regex. Custom `_to_iso_z()` helper emits `YYYY-MM-DDTHH:MM:SS[.fractional]Z`. Applied to `created_at`, `finalized_at`, `heartbeat_at`, `gates[].override_at`.
+
+**C5 — §7.3.2 Helper Functions.** New subsection specifies 9 helpers referenced by §7.3/§7.4/§14.8 but previously undefined: `atomic_write_text`, `apply_pragmas`, `audit_log_append`, `quarantine`, `_escalate_pending_to_quarantine`, `_write_waiting_sidecar`, `_extract_missing_fps`, `check_upstream_integrity`, `compute_cohort_hash`. Each with 5-20 LOC Python reference implementation. `UpstreamNotYetIngestedError.__init__` accepts `missing_fingerprints` kwarg for structured sidecar generation.
+
+**C6 — Schema migration bootstrap rule.** §5.3 now initializes `schema_migration_num='0'` at fresh-DB creation (was undefined — `apply_pending` could behave differently on raw-DDL vs migration-runner bootstrap). §5.7 codifies semver pairing: every migration's LAST statements MUST update both `schema_migration_num` AND `schema_version`; additive→minor bump; breaking→major bump. Atomic-commit rule: TOML + Python codegen + Rust struct + migration SQL MUST land in ONE commit; CI enforces.
+
+**C7 — Pydantic dependency strategy.** §15.1a Day 2 specifies Pydantic as an OPTIONAL-dependency extra in `pyproject.toml`: `[project.optional-dependencies] orchestration = ["pydantic>=2.0,<3.0"]`. Core `hft_contracts` imports are unaffected (preserves backward compat for lean consumers). `hft_contracts.orchestration.*` modules guard imports with a clear error message pointing to `pip install hft-contracts[orchestration]`.
+
+**C8 — Fixture path unified.** Resolved §15.1a vs §18.1b contradiction. Cross-language fixtures (envelopes + canonical_json) live canonically at `hft-contracts/tests/fixtures/`. hft-ops tests symlink to those paths (relative symlinks via git mode 120000). Rust tests read directly (same repo). Legacy + ledger-specific fixtures (ledgers, Parquet, migration golden outputs) stay at `hft-ops/tests/fixtures/ledger/`.
+
+**C9 — §13.3 body updated.** The v1.3 change log claimed Round 13 widened Phase 3.5 gate across all 4 batches, but the §13.3 body still referenced Batch 1 only. Now amended to specify weekly `hft-ops sweep fingerprints --verify` runs across ALL 36 configs throughout Phase 11, with per-batch strict gates and an RFC-required incident protocol for any detected drift. (Fixed in self-check during R14 dispatch.)
+
+**6 operational gaps (R14-C — documented as Phase 11 W2-3 additions, not blockers):**
+
+- G1: `hft-ops ledger status` summary command (~30 LOC) — HIGH priority; prevents silent quarantine accumulation.
+- G2: `ledger backup` fix to tar records/+metrics/+log (not SQLite only) — HIGH priority; fixes §2.2 contradiction.
+- G3: `ledger rotate-log` CLI (~10 LOC) — LOW priority; year-scale.
+- G4: `ledger gc --orphan-parquet` spec — LOW priority; year-scale.
+- G5: Schema-change atomic-commit rule in §5.7 (~50 lines doc) — **APPLIED in C6** above.
+- G6: Progress bars on rebuild/migrate/drain (~20 LOC tqdm) — LOW priority; UX only.
+
+Total effort for G1+G2+G3+G4+G6: ~100 LOC + ~50 lines doc ≈ 1 day of work, added to Phase 11 Week 2-3 scope.
+
+**Validation evidence**: 4 new R14 checks added to commit-time self-audit:
+- §5.3 DDL reparse with 4 new nested-object columns (48-column experiments table).
+- §14.8 query path via `json_extract(training_info_json, '$.normalization_stats_sha256')` — tested end-to-end with synthetic trainer envelope.
+- §7.3.2 helper specs present (9 helpers documented).
+- §5.3 `schema_migration_num='0'` bootstrap row present.
 
 ---
 
