@@ -253,7 +253,7 @@ hft-contracts/                    (github.com/nagarx/hft-contracts.git)
 
 2. **Golden serialization test** (`rust/tests/envelope_golden.rs`):
    - Loads `tests/fixtures/envelopes/golden/01_complete.json` (canonical form, produced by Python).
-   - Deserializes into Rust `Envelope` struct; re-serializes via `canonical_json_dumps`.
+   - Deserializes into Rust `Envelope` struct; re-serializes via `canonical_json_blob` (Rust mirror of `hft_contracts.canonical_hash.canonical_json_blob`).
    - Asserts byte-for-byte equality against the original fixture.
    - **Catches Rust struct drift** (Rust edited without TOML/fixture update) — SCHEMA_HASH alone cannot detect this.
 
@@ -1244,57 +1244,95 @@ MBO extractor is the second-most-complex producer (148-feature schema, 9-crate w
 }
 ```
 
-#### §3.3.6 Canonical JSON Serialization Spec (cross-language)
+#### §3.3.6 Canonical JSON Serialization Spec (cross-language, delegating to SSoT)
 
-**Purpose:** the envelope `experiment_fingerprint` is computed by the producer (Phase 3 `dedup.py`) in Python, but future Rust producers (BQP, MBO extractor) must produce byte-identical fingerprints OR route their fingerprint through Python. This section specifies a single canonical JSON serialization that guarantees parity.
+**Round 16 correction (v1.3.3)**: this section previously specified a NEW `canonical_json_dumps` with compact separators and `allow_nan=False`. Verification against `hft_contracts/canonical_hash.py` (Phase 4 Batch 4c hardening, 2026-04-15) revealed this **violates the frozen monorepo canonical form** which uses DEFAULT separators (`", "` and `": "` — WITH spaces), DEFAULT `ensure_ascii=True`, DEFAULT `allow_nan=True`. Per `hft_contracts/canonical_hash.py:33-37`: **"Compact-separator variants would produce different bytes and break existing fingerprints; the whitespace convention is load-bearing."** And per PA §3024: **"Anti-pattern (eliminated 2026-04-15): pre-Phase-4c `canonical_hash` was re-implemented at 5 sites. ... Extracted to `hft_contracts.canonical_hash` SSoT. When adding a new hash/canonical-form primitive, always place it in `hft-contracts` first, then import; never re-implement."**
 
-**Python side** (authoritative — matches current `dedup.py:390`):
+**Phase 10 REUSES the existing SSoT. No new Python canonical module is created.**
+
+**Python side** (reuse — `hft_contracts.canonical_hash.canonical_json_blob`, frozen contract):
 
 ```python
-# hft_contracts/orchestration/canonical_json.py
-import json
+# Phase 10 consumption pattern (used by ingest, audit log, content_hash):
+from hft_contracts.canonical_hash import canonical_json_blob, sha256_hex
 
-def canonical_json_dumps(obj) -> str:
-    """Deterministic JSON for content hashing + fingerprinting.
-    Matches dedup.py:390 behavior exactly.
-    """
-    return json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),    # no whitespace — compact form
-        ensure_ascii=True,        # escape non-ASCII; avoids encoding drift
-        allow_nan=False,          # reject NaN / Inf; caller must sanitize
-        default=str,              # match dedup.py — non-JSON types fall back to str()
-    )
+# Frozen contract (from hft_contracts/canonical_hash.py):
+#   canonical_json_blob(obj) ≡ json.dumps(
+#       obj, sort_keys=True, default=str
+#   ).encode("utf-8")
+# - DEFAULT separators: ", " (after comma, WITH space), ": " (after colon, WITH space)
+# - DEFAULT ensure_ascii: True (non-ASCII → \uXXXX)
+# - DEFAULT allow_nan: True (NaN → "NaN" token, non-strict-JSON)
+# - sanitize=True option pre-processes NaN/Inf → None (strict-JSON safe)
+# - default=str: Path, Enum fall back to str() representation
+#
+# Phase 10 MUST call with sanitize=True because envelope.metrics[].value
+# legitimately carries NaN-as-missing semantics (e.g., "metric not computed"):
+envelope_bytes = canonical_json_blob(envelope_dict, sanitize=True)
+envelope_content_hash = sha256_hex(envelope_bytes)  # 64-char lowercase hex
 ```
 
-**Rust side** (must produce byte-identical output):
+**Consumers of this SSoT** (pre-existing, Phase 10 joins them):
+- `hft_ops.ledger.dedup.compute_fingerprint` — experiment fingerprint (Phase 3 §3.3b)
+- `hft_ops.provenance.lineage.hash_config_dict`
+- `hft_ops.feature_sets.hashing.compute_feature_set_hash`
+- `hft_evaluator.pipeline.compute_profile_hash`
+- `lobtrainer.data.feature_set_resolver._compute_content_hash` (inlined for cross-venv isolation; parity-locked)
+- **NEW Phase 10**: envelope `content_hash` (§3.5), `ingest_one` idempotency byte-compare (§7.3), `audit_log_append` sidecar content (§7.3.2)
+
+**Rust side** — produce byte-identical output to Python's frozen form:
 
 ```rust
-// hft_contracts_rs/src/canonical_json.rs
+// hft-contracts/rust/orchestration/canonical_json.rs
+//
+// Mirrors Python's hft_contracts.canonical_hash.canonical_json_blob exactly.
+// Frozen contract: json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+//   — DEFAULT whitespace separators (", " and ": " — NOT compact)
+//   — DEFAULT ensure_ascii=True (non-ASCII → \uXXXX)
+//   — sanitize=True: NaN/Inf → null before serialization
+//
+// CRITICAL: serde_json's defaults DIFFER from Python's defaults on both
+//   (a) separators (serde_json = compact ","/":" ; Python default = ", "/": ")
+//   (b) non-ASCII (serde_json = raw UTF-8 bytes; Python default = \uXXXX escape)
+// BOTH divergences must be corrected via post-processing to match Python byte-for-byte.
+
 use serde::Serialize;
 use serde_json::{to_string, Value};
 
-pub fn canonical_json_dumps<T: Serialize>(value: &T) -> Result<String, CanonicalError> {
-    // Serialize to an intermediate Value tree, then re-serialize with sorted keys.
-    // serde_json::to_string produces compact form (no whitespace) matching Python's
-    // separators=(",",":") — BUT does NOT escape non-ASCII characters to \uXXXX.
-    // Python's ensure_ascii=True DOES emit \uXXXX for every non-ASCII code point.
-    // Round 14 C2 fix: explicit post-processing step escape_non_ascii_in_json() to
-    // match Python's output byte-for-byte. This was a latent spec bug until R14-B.
+pub fn canonical_json_blob<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
     let intermediate: Value = serde_json::to_value(value)?;
-    let sorted = sort_keys_recursive(intermediate);
-    // Reject NaN/Inf early (serde_json serializes to `null` by default — WRONG)
-    reject_non_finite(&sorted)?;
-    let raw_utf8 = to_string(&sorted)?;       // compact JSON in UTF-8 (non-ASCII NOT escaped)
-    Ok(escape_non_ascii_in_json(&raw_utf8))   // post-process to match Python ensure_ascii=True
+    let sanitized = sanitize_non_finite(intermediate);      // NaN/Inf → Null (matches Python sanitize=True)
+    let sorted = sort_keys_recursive(sanitized);
+    let compact = to_string(&sorted)?;                      // compact JSON in UTF-8
+    let spaced = restore_python_default_separators(&compact); // "," → ", "  and  ":" → ": "
+    let ascii_escaped = escape_non_ascii_in_json(&spaced);   // non-ASCII → \uXXXX (RFC 8259 §7 surrogates)
+    Ok(ascii_escaped.into_bytes())
+}
+
+pub fn sha256_hex(blob: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(blob))
+}
+
+fn sanitize_non_finite(v: Value) -> Value {
+    match v {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64() {
+                if !f.is_finite() { return Value::Null; }
+            }
+            Value::Number(n)
+        }
+        Value::Object(m) => Value::Object(m.into_iter().map(|(k, vv)| (k, sanitize_non_finite(vv))).collect()),
+        Value::Array(xs) => Value::Array(xs.into_iter().map(sanitize_non_finite).collect()),
+        other => other,
+    }
 }
 
 fn sort_keys_recursive(v: Value) -> Value {
     match v {
         Value::Object(m) => {
             let sorted: std::collections::BTreeMap<String, Value> =
-                m.into_iter().map(|(k, v)| (k, sort_keys_recursive(v))).collect();
+                m.into_iter().map(|(k, vv)| (k, sort_keys_recursive(vv))).collect();
             Value::Object(sorted.into_iter().collect())
         }
         Value::Array(xs) => Value::Array(xs.into_iter().map(sort_keys_recursive).collect()),
@@ -1302,43 +1340,41 @@ fn sort_keys_recursive(v: Value) -> Value {
     }
 }
 
-fn reject_non_finite(v: &Value) -> Result<(), CanonicalError> {
-    match v {
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                if !f.is_finite() {
-                    return Err(CanonicalError::NonFinite);
-                }
-            }
-            Ok(())
+/// Post-process serde_json compact output to Python's default separators:
+///   "," (between items) → ", " (WITH space)
+///   ":" (between key-value) → ": " (WITH space)
+/// Walks the string character-by-character, tracking string-literal context so
+/// that separators INSIDE string values are NOT modified.
+fn restore_python_default_separators(compact: &str) -> String {
+    let mut out = String::with_capacity(compact.len() + compact.len() / 8);
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for c in compact.chars() {
+        if in_string {
+            out.push(c);
+            if c == '"' && !prev_backslash { in_string = false; }
+            prev_backslash = c == '\\' && !prev_backslash;
+            continue;
         }
-        Value::Object(m) => m.values().try_for_each(reject_non_finite),
-        Value::Array(xs) => xs.iter().try_for_each(reject_non_finite),
-        _ => Ok(()),
+        out.push(c);
+        if c == '"' { in_string = true; prev_backslash = false; continue; }
+        if c == ',' || c == ':' { out.push(' '); }
     }
+    out
 }
 
-/// Post-process a UTF-8 JSON string to escape every non-ASCII character as
-/// `\uXXXX` (or surrogate pair for supplementary code points per RFC 8259).
-/// This matches Python's `json.dumps(..., ensure_ascii=True)` output.
-///
-/// Walks the JSON output character-by-character, tracking whether we're inside
-/// a string literal (to avoid escaping chars that are already inside `\uXXXX`
-/// sequences — though those are pure ASCII so this tracking is for correctness,
-/// not for that specific case).
+/// Escape non-ASCII characters as \uXXXX (surrogate pairs for supplementary code points).
+/// Matches Python's json.dumps(..., ensure_ascii=True) output byte-for-byte.
 fn escape_non_ascii_in_json(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut in_string = false;
     let mut prev_backslash = false;
     for c in raw.chars() {
         if !in_string {
-            // Not in a string literal: plain ASCII JSON structural chars only.
-            // serde_json never emits non-ASCII outside string literals.
             if c == '"' { in_string = true; }
             out.push(c);
             continue;
         }
-        // Inside a string literal.
         if c == '"' && !prev_backslash {
             in_string = false;
             out.push(c);
@@ -1351,10 +1387,8 @@ fn escape_non_ascii_in_json(raw: &str) -> String {
         } else {
             let code = c as u32;
             if code <= 0xFFFF {
-                // BMP: single \uXXXX
                 out.push_str(&format!("\\u{:04x}", code));
             } else {
-                // Supplementary plane: surrogate pair per RFC 8259 §7
                 let adjusted = code - 0x10000;
                 let high = 0xD800 + (adjusted >> 10);
                 let low  = 0xDC00 + (adjusted & 0x3FF);
@@ -1365,30 +1399,31 @@ fn escape_non_ascii_in_json(raw: &str) -> String {
     out
 }
 
-// CanonicalError — error type referenced by canonical_json_dumps.
-// Round 15 B5 fix: was referenced but not defined in R14 commit of v1.3.1.
 #[derive(thiserror::Error, Debug)]
 pub enum CanonicalError {
-    #[error("non-finite number in JSON (NaN/Inf/-Inf)")]
-    NonFinite,
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
 }
 
-// Test fixture 03_unicode.json verifies byte-equal with Python ensure_ascii=True:
-//   Input:  {"sym":"Ω"}
-//   Python: {"sym":"\u03a9"}
-//   Rust:   {"sym":"\u03a9"}   // matches ONLY with escape_non_ascii_in_json
+// Test fixtures anchor byte-exact parity with Python:
+//   Input  {"sym": "Ω", "n": 10}
+//   Python canonical_json_blob(obj) → '{"n": 10, "sym": "\u03a9"}'  (whitespace + ASCII escape)
+//   Rust   canonical_json_blob(&obj) → same bytes
 ```
 
-**Invariants (tested by cross-lang fixtures):**
+**Invariants (tested by cross-lang fixtures at `hft-contracts/tests/fixtures/canonical_json/`):**
 1. **Key order**: lexicographic ASCII sort at every nesting level (matches Python `sort_keys=True`).
-2. **Separators**: `","` between items, `":"` between key-value (no spaces).
-3. **Encoding**: non-ASCII characters escaped as `\uXXXX` (matches Python `ensure_ascii=True`).
-4. **NaN / Inf / -Inf**: rejected with error (Python `allow_nan=False`; Rust `reject_non_finite`).
-5. **Integer representation**: JSON numbers without decimal point (e.g., `10` not `10.0`). Python handles this via `json.dumps`; Rust via `serde_json::Number::Integer`.
-6. **Unicode normalization**: NOT applied (same raw bytes on both sides; no NFC/NFD reshaping).
-7. **Trailing whitespace**: none.
+2. **Separators**: `", "` between items (WITH space), `": "` between key-value (WITH space) — Python default. Rust `restore_python_default_separators` post-processes serde_json's compact output.
+3. **Encoding**: non-ASCII characters escaped as `\uXXXX` with surrogate pairs for supplementary code points (matches Python `ensure_ascii=True` default).
+4. **NaN / Inf / -Inf**: pre-processed to `null` via `sanitize=True` (Python) / `sanitize_non_finite` (Rust). Callers that legitimately carry NaN-as-missing (envelope metrics) use sanitize=True; callers that cannot tolerate NaN should catch `ValueError` at Pydantic validation time BEFORE reaching canonical_json_blob.
+5. **Integer representation**: JSON numbers without decimal point (e.g., `10` not `10.0`). Both sides.
+6. **Unicode normalization**: NOT applied (same raw bytes; no NFC/NFD reshaping).
+7. **Trailing whitespace**: none at end of output.
+
+**Content hash formula** (used by §3.5 envelope filename, §7.3 idempotent compare, §14.8 integrity checks):
+```
+content_hash = sha256_hex(canonical_json_blob(envelope_dict, sanitize=True))
+```
 
 **Test fixture** (shipped in `hft-contracts/tests/fixtures/canonical_json/`):
 
@@ -1403,7 +1438,7 @@ fixtures/canonical_json/
 └── expected_sha256.json    → {fixture: hex_hash} — identical across Python + Rust
 ```
 
-The Rust `hft_contracts` crate imports these fixtures and asserts `canonical_json_dumps` produces the matching hash; the Python `hft_contracts` package does the same. CI runs both suites on every PR.
+The Rust `hft_contracts_rs` crate imports these fixtures and asserts `canonical_json_blob` produces the matching hash; the Python `hft_contracts.canonical_hash.canonical_json_blob` does the same. CI runs both suites on every PR.
 
 **Non-goal for v1:** floating-point representation stability across Python ↔ Rust when numbers have >15 significant digits. Document as known limitation; producers should either (a) round to 12 digits before hashing, or (b) pass all floating-point values through Python first.
 
@@ -1416,7 +1451,7 @@ The Rust `hft_contracts` crate imports these fixtures and asserts `canonical_jso
 
 ### §3.5 Envelope Filename Convention
 
-`hft-ops/ledger/inbox/{content_hash}.json` where `content_hash = sha256(canonical_json_dumps(envelope))` — the **full** envelope including `metadata_json`.
+`hft-ops/ledger/inbox/{content_hash}.json` where `content_hash = sha256_hex(canonical_json_blob(envelope_dict, sanitize=True))` — the **full** envelope including `metadata_json`. Uses the monorepo SSoT form per §3.3.6 (Round 16 v1.3.3 correction: delegates to `hft_contracts.canonical_hash.canonical_json_blob` rather than a new `canonical_json_dumps`).
 
 **Round 13 change (D3)**: previously, `metadata_json` was excluded from content hash on the theory that "metadata_json is an escape hatch and should not affect identity." Under stress-testing this creates a silent-data-loss path: if producer emits twice in rapid succession with DIFFERENT `metadata_json` (e.g., retry adds debug info), both envelopes get the same filename — `os.replace()` silently overwrites the first. Per `hft-rules §8` ("Never silently drop, clamp, or 'fix' data without recording diagnostics"), this is unacceptable.
 
@@ -2659,11 +2694,16 @@ def ingest_one(envelope_path: Path, ledger_dir: Path, dry_run: bool = False) -> 
         return IngestOneResult.would_insert(validated)
 
     # Step 2: append-only JSON record (atomic tmp+rename). Canonical form comparison for idempotency.
-    # Round 13 (D3/B4 fix): both sides compared as canonical_json_dumps(validated.model_dump()) —
-    # NOT raw inbox bytes. Raw inbox file may have whitespace/key-order variation even if semantically
-    # identical; Pydantic roundtrip canonicalizes. See §3.3.6 invariants.
+    # Round 13 (D3/B4) + Round 16 (v1.3.3): both sides compared via SSoT canonical form from
+    # hft_contracts.canonical_hash (frozen contract; NOT a new canonical_json_dumps). Raw inbox file
+    # may have whitespace/key-order variation even if semantically identical; Pydantic roundtrip
+    # + canonical_json_blob canonicalizes. See §3.3.6 invariants.
+    from hft_contracts.canonical_hash import canonical_json_blob, sha256_hex
     record_path = ledger_dir / "records" / f"{validated.experiment_id}.json"
-    canonical_new = canonical_json_dumps(validated.model_dump(by_alias=False, exclude_none=False))
+    canonical_new = canonical_json_blob(
+        validated.model_dump(by_alias=False, exclude_none=False),
+        sanitize=True,  # NaN/Inf → None (envelope.metrics[].value may be NaN)
+    ).decode('utf-8')
     if record_path.exists():
         canonical_existing = record_path.read_text()
         if canonical_existing == canonical_new:
@@ -2800,7 +2840,7 @@ Below are the **column orderings** that runtime generation must produce. Any dev
 -- insert_experiment: ONE row per envelope
 -- Round 14 C1: adds 4 nested-object JSON columns (training_info_json,
 -- signal_provenance_json, strategy_info_json, export_stats_json). Serialized
--- from the Pydantic sub-models via canonical_json_dumps at ingest time;
+-- from the Pydantic sub-models via canonical_json_blob (SSoT) at ingest time;
 -- queryable via SQLite json_extract().
 INSERT INTO experiments (
     experiment_fingerprint, experiment_id, fingerprint_version,
@@ -2987,11 +3027,14 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
 **`audit_log_append(ledger_dir: Path, envelope: Envelope, result: str, duration_ms: int, note: str | None = None) -> None`** — appends ONE JSONL line to `hft-ops/ledger/ingest.log` using `O_APPEND` (atomic single-writer; `flock(ledger.lock)` is held by the caller).
 
 ```python
+from hft_contracts.canonical_hash import canonical_json_blob, sha256_hex
+
 def audit_log_append(ledger_dir: Path, envelope: Envelope, *, result: str,
                      duration_ms: int, note: str | None = None) -> None:
-    line = canonical_json_dumps({
+    envelope_blob = canonical_json_blob(envelope.model_dump(mode='json'), sanitize=True)
+    line_dict = {
         "ingested_at": _utc_now_iso_z(),
-        "envelope_content_hash": sha256(canonical_json_dumps(envelope.model_dump(mode='json'))).hexdigest(),
+        "envelope_content_hash": sha256_hex(envelope_blob),
         "experiment_id": envelope.experiment_id,
         "experiment_fingerprint": envelope.experiment_fingerprint,
         "envelope_version": envelope.envelope_version,
@@ -2999,7 +3042,8 @@ def audit_log_append(ledger_dir: Path, envelope: Envelope, *, result: str,
         "duration_ms": duration_ms,
         "result": result,  # inserted | duplicate_idempotent | duplicate_pk | pending_upstream | rejected | error
         "note": note,
-    })
+    }
+    line = canonical_json_blob(line_dict, sanitize=True).decode('utf-8')
     log_path = ledger_dir / "ingest.log"
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -3017,10 +3061,10 @@ def quarantine(envelope_path: Path, reason: str) -> IngestOneResult:
     q_path = q_dir / envelope_path.name
     err_path = q_path.with_suffix(".error")
     # Write .error sidecar FIRST (so an interrupted move doesn't leave a quarantined envelope without context)
-    atomic_write_text(err_path, canonical_json_dumps({
+    atomic_write_text(err_path, canonical_json_blob({
         "reason": reason, "quarantined_at": _utc_now_iso_z(),
         "original_path": str(envelope_path), "handler_version": SCHEMA_INFO_VERSION,
-    }))
+    }, sanitize=True).decode('utf-8'))
     os.replace(envelope_path, q_path)
     audit_log_append(envelope_path.parent.parent, None, result="rejected", duration_ms=0, note=reason)
     return IngestOneResult.quarantined(envelope_path, reason)
@@ -3034,11 +3078,11 @@ def _escalate_pending_to_quarantine(pending_path: Path, ledger_dir: Path, reason
     waiting_data = json.loads(waiting_sidecar.read_text()) if waiting_sidecar.exists() else {}
     q_path = ledger_dir / "quarantine" / pending_path.name
     err_path = q_path.with_suffix(".error")
-    atomic_write_text(err_path, canonical_json_dumps({
+    atomic_write_text(err_path, canonical_json_blob({
         "reason": reason, "quarantined_at": _utc_now_iso_z(),
         "previously_pending_for": waiting_data.get("waiting_since"),
         "missing_fingerprints": waiting_data.get("missing_fingerprints", []),
-    }))
+    }, sanitize=True).decode('utf-8'))
     os.replace(pending_path, q_path)
     if waiting_sidecar.exists():
         waiting_sidecar.unlink()
@@ -3049,11 +3093,11 @@ def _escalate_pending_to_quarantine(pending_path: Path, ledger_dir: Path, reason
 ```python
 def _write_waiting_sidecar(pending_path: Path, missing_fingerprints: list[str]) -> None:
     sidecar = pending_path.with_suffix(".waiting")
-    atomic_write_text(sidecar, canonical_json_dumps({
+    atomic_write_text(sidecar, canonical_json_blob({
         "waiting_since": _utc_now_iso_z(),
         "missing_fingerprints": sorted(missing_fingerprints),
         "age_out_policy": "escalate_to_quarantine_after_24h",
-    }))
+    }, sanitize=True).decode('utf-8'))
 ```
 
 **`_extract_missing_fps(exc: UpstreamNotYetIngestedError, validated: Envelope) -> list[str]`** — extracts the list of missing fingerprints for the sidecar. Uses attribute access (preferred) + exception message fallback.
@@ -3118,7 +3162,7 @@ def compute_cohort_hash(envelope: Envelope) -> str:
     # Drop data_manifest sub-field inside extraction_config if present
     if "sampling_config" in components and isinstance(components["sampling_config"], dict):
         components["sampling_config"].pop("data_manifest", None)
-    return sha256(canonical_json_dumps(components).encode("utf-8")).hexdigest()
+    return sha256_hex(canonical_json_blob(components, sanitize=True))
 ```
 
 All 9 helpers are pure-Python, stateless except as they touch the filesystem. They have unit tests in `hft-ops/tests/test_ingest_helpers.py` (~10-12 tests covering the happy path + 1-2 edge cases each).
@@ -4234,15 +4278,16 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
   from .envelope import Envelope  # noqa: E402
   from .metric_keys import MetricKey  # noqa: E402
   from .gate_keys import GateKey  # noqa: E402
-  from .canonical_json import canonical_json_dumps  # noqa: E402
+  # Round 16 v1.3.3: NO new canonical_json module. Re-export from SSoT.
+  from hft_contracts.canonical_hash import canonical_json_blob, sha256_hex, sanitize_for_hash  # noqa: E402,F401
   from .upstream import resolve_upstream_ref, UpstreamRef  # noqa: E402
   ```
 - Extend `contracts/generate_python_contract.py` to emit `hft_contracts/orchestration/envelope.py` (Pydantic v2 model), `metric_keys.py` (enum), `gate_keys.py` (enum) from the TOML. The existing single-output-file pattern becomes multi-output — refactor `OUTPUT_PATH` into a dict keyed by generator name.
 - **Round 15 B9 — Pydantic sub-model naming convention**: codegen emits one `BaseModel` subclass per nested object declared in §3.2, named in TitleCase with singular form for array items: `LineageEntry`, `ArtifactEntry`, `MetricEntry`, `GateEntry`, `BulkParquetEntry`, `ExportStats`, `TrainingInfo`, `StrategyInfo`, `SignalProvenance`, `GitInfo`. Required so the C4 `@field_serializer('override_at')` on `GateEntry` and the C4 `@field_serializer('created_at', 'finalized_at', 'heartbeat_at')` on `Envelope` attach at the correct class. `sub_records` stays `List[Dict[str, Any]]` (§3.2 declares items as opaque `{type: object}` with no properties — no nested Pydantic needed).
 - **Round 15 A9 — hft-ops transitive dependency**: hft-ops consumes `hft_contracts.orchestration` (envelope validation, canonical JSON, etc.), so `hft-ops/pyproject.toml` MUST declare its hft-contracts dependency with the `orchestration` extra: `hft-contracts[orchestration]>=X.Y.Z` (NOT bare `hft-contracts`). Any consumer of hft-ops installing it via `pip install hft-ops` thus gets Pydantic transitively. Same applies to lob-model-trainer and lob-backtester's pyproject.toml when they start emitting envelopes (Week 4). Verify during Week 2 pyproject updates.
-- Also hand-write `hft_contracts/orchestration/canonical_json.py` (not codegen'd — it's a utility, not derived from TOML).
-- Run `python contracts/generate_python_contract.py` → verify 3 output files parse as Python.
-- `pip install -e .[orchestration] && python -c "from hft_contracts.orchestration import Envelope"` succeeds.
+- **Round 16 v1.3.3 change**: DO NOT hand-write `hft_contracts/orchestration/canonical_json.py`. The monorepo already has the canonical form SSoT at `hft_contracts/canonical_hash.py` (Phase 4 Batch 4c, 2026-04-15). Phase 10 REUSES it. `orchestration/__init__.py` re-exports `canonical_json_blob`, `sha256_hex`, `sanitize_for_hash` for caller convenience but adds ZERO new canonical-form logic. This eliminates duplication per hft-rules §0 "Reuse-first".
+- Run `python contracts/generate_python_contract.py` → verify 3 output files parse as Python (envelope.py, metric_keys.py, gate_keys.py — NO canonical_json.py).
+- `pip install -e .[orchestration] && python -c "from hft_contracts.orchestration import Envelope, canonical_json_blob"` succeeds.
 
 **Day 3 — Hand-crafted golden fixture + Pydantic Z-serializer**:
 - **Round 14 C4 decision**: Pydantic v2's `model_dump(mode='json')` emits datetimes as `+00:00` UTC offset — this FAILS the B1 regex requiring `Z` suffix. The codegen'd Pydantic model MUST declare `@field_serializer` methods on every timestamp field. Add to `envelope.py`:
@@ -4273,11 +4318,13 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 - By hand, construct ONE valid envelope JSON conforming to every §3.2 field (including nested `lineage[]`, `artifacts[]`, `bulk_parquet[]`, `metrics[]`, `gates[]`, `training_info`, `signal_provenance`, `strategy_info`, `export_stats`). Avoid `.parquet` paths that would require Parquet fixtures (use `bulk_parquet: []`).
 - Validate it: `Envelope.model_validate_json(sample.read_text())` must succeed.
 - Save to `hft-contracts/tests/fixtures/envelopes/golden/01_complete.json`.
-- Compute canonical form:
+- Compute canonical form (Round 16 v1.3.3 — uses SSoT):
   ```python
+  from hft_contracts.canonical_hash import canonical_json_blob
   env = Envelope.model_validate_json(sample.read_text())
-  canonical = canonical_json_dumps(env.model_dump(mode='json', exclude_none=False))
-  (golden_dir / '01_complete_canonical.json').write_text(canonical)
+  # sanitize=True because envelope.metrics[].value may legitimately be NaN
+  canonical_bytes = canonical_json_blob(env.model_dump(mode='json', exclude_none=False), sanitize=True)
+  (golden_dir / '01_complete_canonical.json').write_bytes(canonical_bytes)
   ```
 - These TWO files become the cross-lang parity ground truth for Day 5.
 
@@ -4289,9 +4336,9 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 **Day 5 — Rust crate skeleton + parity test**:
 - Create `hft-contracts/Cargo.toml` (single `[package]` at repo root per §2.5.1 — NO workspace) + `hft-contracts/rust/lib.rs` + `rust/orchestration/mod.rs` + `rust/orchestration/envelope.rs` (hand-written struct mirroring the Pydantic model).
 - Declare dependencies in `Cargo.toml`: `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `sha2 = "0.10"`, `thiserror = "1"`. Set `publish = false`.
-- Implement `canonical_json_dumps` in Rust per §3.3.6 (WITH `escape_non_ascii_in_json` post-processor — Round 14 C2 fix).
+- Implement `canonical_json_blob` in Rust per §3.3.6 (must mirror Python's DEFAULT form: whitespace separators via `restore_python_default_separators`, `escape_non_ascii_in_json` post-processor per R14 C2, `sanitize_non_finite` pre-processor for NaN/Inf → null). **Round 16 v1.3.3**: renamed from `canonical_json_dumps` to match Python SSoT name.
 - Add `pub const SCHEMA_HASH: &str = "..."` in `rust/orchestration/schema_hash.rs` (separate file so the verifier script can rewrite it without disturbing the struct definition).
-- Write `rust/tests/envelope_golden.rs` that deserializes `tests/fixtures/envelopes/golden/01_complete.json`, re-serializes via `canonical_json_dumps`, asserts byte-equal against `golden/01_complete_canonical.json`.
+- Write `rust/tests/envelope_golden.rs` that deserializes `tests/fixtures/envelopes/golden/01_complete.json`, re-serializes via `canonical_json_blob` (Rust), asserts byte-equal against `golden/01_complete_canonical.json` (produced by Python SSoT).
 - Run `cargo test` (NOT `cargo test -p` — no workspace) — passes.
 - Run `contracts/verify_rust_envelope_schema.py` — computes TOML hash, writes `SCHEMA_HASH` const via regex-replace in `rust/orchestration/schema_hash.rs`, commits.
 - **Week 1 exit gate**: `test_rust_envelope_serialization_matches_python_golden` AND `test_schema_hash_verify_catches_toml_drift` both pass. If parity fails, STOP: defer all Rust work to Phase 11.5 and re-plan Weeks 2-4 without Rust dependencies.
@@ -4300,7 +4347,7 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 
 **Round 15 B7 — explicit scope boundary**: Week 1 delivers the **envelope contract plane only** (TOML → Python Pydantic + enums + canonical JSON + Rust struct + parity test). The SQLite DDL (§5.3), migration file `001_initial_v1_0_0.sql`, and ledger runtime (`hft_ops.ledger.*` Python module) are **Week 2 scope**. Week 1 exit gate depends ONLY on envelope+codegen+parity — NOT on SQLite being functional. This boundary prevents scope creep from pulling Week-2 plumbing into Week 1.
 
-**Round 15 B4 — fixture canonicalization convention**: when producing Day 4 derived fixtures by hand-editing the golden, the workflow is: (a) edit file as desired, (b) run through `Envelope.model_validate_json(text).model_dump(mode='json', exclude_none=False)`, (c) feed to `canonical_json_dumps()`, (d) write THAT output — not the raw hand-edit — as the final fixture. The `expected_sha256.json` hashes are computed from step (d) output. This guarantees every fixture is canonical-form regardless of hand-editing drift.
+**Round 15 B4 (Round 16 v1.3.3 updated) — fixture canonicalization convention**: when producing Day 4 derived fixtures by hand-editing the golden, the workflow is: (a) edit file as desired, (b) run through `Envelope.model_validate_json(text).model_dump(mode='json', exclude_none=False)`, (c) feed to `canonical_json_blob(..., sanitize=True)` (the SSoT from `hft_contracts.canonical_hash`), (d) write THAT output — not the raw hand-edit — as the final fixture. The `expected_sha256.json` hashes are computed from step (d) output via `sha256_hex(canonical_json_blob(...))`. This guarantees every fixture is canonical-form regardless of hand-editing drift.
 
 ### §15.2 Phase 12: Sweep v2 + Parallel Execution (2 weeks)
 
@@ -4463,7 +4510,7 @@ hft-contracts/tests/fixtures/
 ├── envelopes/
 │   ├── golden/                          # Round 14 C8 — cross-lang parity anchor
 │   │   ├── 01_complete.json             # hand-crafted; every §3.2 field populated
-│   │   └── 01_complete_canonical.json   # canonical_json_dumps output of the above
+│   │   └── 01_complete_canonical.json   # canonical_json_blob(..., sanitize=True) output of the above (Python SSoT)
 │   ├── valid/                           # one per record_type, representative
 │   │   ├── v1_bqp_export.json
 │   │   ├── v1_mbo_export.json
@@ -4783,7 +4830,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | **`UpstreamNotYetIngestedError`** | Soft ingest failure signaling the upstream producer's envelope hasn't arrived yet. Routes to `pending/`, retried on subsequent ingest calls, escalates to quarantine after 24h. NOT to be conflated with `IntegrityError` (hard failure) or `NormalizationStatsMismatchError` (real drift, immediate quarantine). |
 | **`SCHEMA_HASH`** | `pub const` in `hft_contracts_rs::orchestration::envelope` that equals `sha256(canonical_json(envelope_schema_from_toml))`. CI-verified by `contracts/verify_rust_envelope_schema.py`. Catches TOML-side drift. Round 13 D2 addition. |
 | **Golden envelope fixture** | `tests/fixtures/envelopes/golden/01_complete.json` + its canonical form. Rust golden-serialization test asserts Rust `Envelope` struct re-serialization is byte-equal. Catches Rust-side struct drift (complements SCHEMA_HASH which catches TOML-side drift). |
-| **Canonical form of envelope** | `canonical_json_dumps(Envelope.model_validate_json(raw).model_dump())` — Pydantic roundtrip through canonical JSON. Used for `records/{id}.json` byte-storage AND for the idempotent byte-compare at ingest (§7.3 amended). Distinct from the raw inbox bytes which may have non-canonical whitespace/key-order variation. |
+| **Canonical form of envelope** | `canonical_json_blob(Envelope.model_validate_json(raw).model_dump(mode='json', exclude_none=False), sanitize=True)` — Pydantic roundtrip through the monorepo SSoT (`hft_contracts.canonical_hash.canonical_json_blob`; frozen contract: `json.dumps(obj, sort_keys=True, default=str).encode("utf-8")`). Used for `records/{id}.json` byte-storage AND for the idempotent byte-compare at ingest. Distinct from the raw inbox bytes which may have non-canonical whitespace/key-order variation. Round 16 v1.3.3 correction: was `canonical_json_dumps` with compact separators — replaced to reuse SSoT per hft-rules §0 "Reuse-first". |
 | **HFT_OPS_LEDGER_INBOX** | Env var set by the orchestrator to the absolute path of `hft-ops/ledger/inbox/`. Producers read this to know where to write envelopes. Missing under `HFT_OPS_ORCHESTRATED=1` → fail-fast; missing in standalone mode → warn-skip. Round 13 B2 addition. |
 
 ---
@@ -4815,6 +4862,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | Draft v1.3 — Round 12/13 | 2026-04-15 | Applied Round 12 pre-implementation validation (3 agents: sequencing, cross-phase integration, implementation-surface) + Round 13 self-stress-test refinements. Added 8 blockers (B1-B8) + 4 decision amendments (D1-D4). See Round 12/13 Amendments below. |
 | Draft v1.3.1 — Round 14 | 2026-04-15 | Applied Round 14 validation (3 agents: v1.3 adversarial audit, Week-1 implementer dry-run, 3-month production-pilot stress-test). 9 critical fixes C1-C9 applied; 6 operational gaps documented as Phase 11 W2-3 additions. See Round 14 Amendments below. |
 | Draft v1.3.2 — Round 15 | 2026-04-15 | Applied Round 15 validation (2 agents: post-v1.3.1 amendment stress-test, Day-1 GO/NO-GO gate + self-check). 13 micro-fixes: A2 rebuild Pydantic-roundtrip parity; A5 TOML `'''` escape guard; A8 local-dev workflow UX; A9 hft-ops transitive dep; A10 `importlib.resources` fallback for pip-install CI; A11 `sweep fingerprints --verify` CLI added to deliverables; B4 fixture canonicalization workflow; B5 `CanonicalError` enum defined in §3.3.6; B7 Week 1 scope boundary (SQLite is Week 2); B9 Pydantic sub-model naming convention; self-check `SCHEMA_INFO_VERSION` + `_utc_now_iso_z` + `IngestOneResult` class. **Day 1 coding GREEN-LIT.** |
+| Draft v1.3.3 — Round 16 | 2026-04-16 | **Critical SSoT correction after Day 1 verification**: every prior round specified a NEW `canonical_json_dumps` with compact separators + `allow_nan=False` for Phase 10. Day 1 verification against root CLAUDE.md + PIPELINE_ARCHITECTURE.md §2988/3024 revealed this violates the **frozen monorepo canonical form** at `hft_contracts/canonical_hash.py` (Phase 4 Batch 4c hardening, 2026-04-15). The SSoT uses DEFAULT separators (`", "` and `": "` — WITH spaces), DEFAULT `ensure_ascii=True`, default `allow_nan=True` with `sanitize=True` option. Per the frozen contract: "Compact-separator variants would produce different bytes and break existing fingerprints." Per PA §3024: "When adding a new hash/canonical-form primitive, always place it in `hft-contracts` first, then import; never re-implement." **Fix**: Phase 10 REUSES `hft_contracts.canonical_hash.canonical_json_blob` — no new Python module. §3.3.6 rewritten to delegate. Rust side mirrors Python's DEFAULT form (whitespace separators + ASCII escape + NaN→null sanitize). §15.1a Day 2 deliverable "hand-write canonical_json.py" DELETED. All call sites updated (§3.5, §7.3, §7.3.2 helpers, §14.8, §15.1a Day 3, §18.1b fixture description, Appendix A glossary). **Day 1 output (pipeline_contract.toml) unaffected** — it contains only schema data, no canonical-form references. Day 2 coding unblocked with corrected spec. |
 
 ### Round 10 Amendments (v1 → v1.1)
 
