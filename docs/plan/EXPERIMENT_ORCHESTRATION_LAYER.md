@@ -196,13 +196,75 @@ No new soft exceptions without updating this principle.
 
 **Rationale**: Eliminates schema drift. Matches existing `FeatureIndex`/`LabelContract`/`ValidationConfig` patterns.
 
-**Implementation**: 
+**Implementation**:
 - Envelope schema defined in `pipeline_contract.toml` under `[orchestration.envelope]`.
 - MetricKey enum defined in `pipeline_contract.toml` under `[orchestration.metric_keys]`.
-- Codegen: `contracts/generate_python_contract.py` produces `hft_contracts/orchestration.py` (Pydantic model + enum).
-- Rust producers verify against the codegen'd Python via `verify_rust_constants.py`-style hash check.
+- Python codegen: `contracts/generate_python_contract.py` produces `hft_contracts/orchestration.py` (Pydantic model + enum).
+- Rust side: hand-maintained struct in `hft_contracts_rs::orchestration` crate — verified by TWO complementary checks (see §2.5.1).
 
 **Anti-pattern rejected**: Independent schema definitions per module. MLflow's ad-hoc params.
+
+#### §2.5.1 Rust `hft_contracts_rs` crate — location, layout, verification (Round 13)
+
+**Location**: co-located with the Python `hft-contracts` package at `github.com/nagarx/hft-contracts.git`. Single-package Rust crate at the repo root, matching the `hft-statistics` precedent (single `[package]` root, no Cargo workspace — verified simpler and already-proven pattern).
+
+**Repository layout**:
+
+```
+hft-contracts/                    (github.com/nagarx/hft-contracts.git)
+├── Cargo.toml                    [package] name = "hft_contracts_rs"
+│                                 [lib]  name = "hft_contracts_rs"
+│                                        path = "rust/lib.rs"
+├── pyproject.toml                Python package (unchanged from today)
+├── src/hft_contracts/            Python source (unchanged — existing 165+ tests pass)
+│   ├── __init__.py
+│   ├── _generated.py             Python codegen output (existing)
+│   └── orchestration/            NEW — Phase 11 Week 1
+│       ├── __init__.py
+│       ├── envelope.py           Pydantic model
+│       ├── metric_keys.py        Enum + TOML loader
+│       ├── gate_keys.py          Enum + TOML loader
+│       ├── canonical_json.py     Shared serializer (§3.3.6)
+│       └── upstream.py           .envelope-ref reader (§7.1.1)
+├── rust/                         NEW — Rust source at non-conflicting path
+│   ├── lib.rs
+│   └── orchestration/
+│       ├── mod.rs
+│       ├── envelope.rs           Hand-written struct + SCHEMA_HASH const
+│       ├── metric_keys.rs
+│       ├── gate_keys.rs
+│       ├── canonical_json.rs
+│       ├── upstream.rs
+│       └── fingerprint.rs        compute_fingerprint_export for Rust producers
+└── tests/
+    └── fixtures/
+        ├── canonical_json/       Shared Python + Rust fixtures (§18.1b)
+        └── envelopes/golden/     Canonical golden envelopes (§18.2)
+```
+
+**Rationale for this layout**: `[lib] path = "rust/lib.rs"` is standard Cargo syntax allowing Rust source outside `src/`. Keeps Python import path `src/hft_contracts/*` unchanged (no existing consumer breakage). Rust consumers depend on the root `[package]` via `hft_contracts_rs = { git = "https://github.com/nagarx/hft-contracts.git", branch = "main" }` — identical pattern to `hft-statistics`. No workspace complexity.
+
+**Verification protocol — TWO complementary checks, both required in CI**:
+
+1. **SCHEMA_HASH verification** (`contracts/verify_rust_envelope_schema.py`):
+   - Computes `sha256(canonical_json_of_envelope_schema_from_toml)`.
+   - Rust source at `rust/orchestration/envelope.rs` carries `pub const SCHEMA_HASH: &str = "<hex>";`.
+   - CI asserts the TOML-derived hash equals the Rust-side const. **Catches TOML drift** (TOML edited without Rust update).
+
+2. **Golden serialization test** (`rust/tests/envelope_golden.rs`):
+   - Loads `tests/fixtures/envelopes/golden/01_complete.json` (canonical form, produced by Python).
+   - Deserializes into Rust `Envelope` struct; re-serializes via `canonical_json_dumps`.
+   - Asserts byte-for-byte equality against the original fixture.
+   - **Catches Rust struct drift** (Rust edited without TOML/fixture update) — SCHEMA_HASH alone cannot detect this.
+
+Both checks are required because they catch DIFFERENT drift directions. See §18.2 for test specifications.
+
+**Consumption patterns**:
+- BQP (standalone repo): `hft_contracts_rs = { git = "https://github.com/nagarx/hft-contracts.git", branch = "main" }` (Phase 11.5 addition — BQP is NOT touched in Phase 11).
+- MBO extractor workspace: same git dep + `.cargo/config.toml` path override for local dev (matches `hft-statistics` pattern documented in root CLAUDE.md).
+- Future OPRA feature-extractor: same pattern when that repo is created.
+
+**Python+Rust coexistence at repo root**: having both `Cargo.toml` and `pyproject.toml` at the same directory is legal and non-conflicting — the two tool ecosystems read disjoint config files. Python build (`pip install -e .`) ignores `Cargo.toml`; Rust build (`cargo build`) ignores `pyproject.toml`. Single git repo, single contract-change commit updates both.
 
 ### §2.6 Validate at Boundaries, Trust Internal Code
 
@@ -353,17 +415,20 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
     "created_at": {
       "type": "string",
       "format": "date-time",
-      "description": "ISO 8601 with UTC timezone. Producer wall-clock start time."
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$",
+      "description": "ISO 8601 UTC with Z suffix (NO offset like '+00:00'). Producer wall-clock start time. Round 13 B1: pattern enforces Z-only to prevent local-time leaks (e.g., Python datetime.now().isoformat() emits +00:00 which reads correctly but partitions Parquet yyyy_mm incorrectly near midnight UTC boundary)."
     },
     "finalized_at": {
       "type": ["string", "null"],
       "format": "date-time",
-      "description": "ISO 8601. Producer wall-clock completion. NULL for status=running."
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$",
+      "description": "ISO 8601 UTC with Z suffix. Producer wall-clock completion. NULL for status=running."
     },
     "heartbeat_at": {
       "type": ["string", "null"],
       "format": "date-time",
-      "description": "Updated periodically by long-running producers (streaming future). Ignored for batch."
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$",
+      "description": "ISO 8601 UTC with Z suffix. Updated periodically by long-running producers (streaming future). Ignored for batch."
     },
     "status": {
       "type": "string",
@@ -519,7 +584,7 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
           "note": {"type": ["string", "null"]},
           "override_by": {"type": ["string", "null"], "description": "User or CI identifier"},
           "override_reason": {"type": ["string", "null"]},
-          "override_at": {"type": ["string", "null"], "format": "date-time"}
+          "override_at": {"type": ["string", "null"], "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"}
         }
       }
     },
@@ -1287,11 +1352,15 @@ The Rust `hft_contracts` crate imports these fixtures and asserts `canonical_jso
 
 ### §3.5 Envelope Filename Convention
 
-`hft-ops/ledger/inbox/{content_hash}.json` where `content_hash = sha256(envelope_minus_metadata_json)`.
+`hft-ops/ledger/inbox/{content_hash}.json` where `content_hash = sha256(canonical_json_dumps(envelope))` — the **full** envelope including `metadata_json`.
 
-Content hash excludes `metadata_json` (escape hatch — forward compat must not affect identity).
+**Round 13 change (D3)**: previously, `metadata_json` was excluded from content hash on the theory that "metadata_json is an escape hatch and should not affect identity." Under stress-testing this creates a silent-data-loss path: if producer emits twice in rapid succession with DIFFERENT `metadata_json` (e.g., retry adds debug info), both envelopes get the same filename — `os.replace()` silently overwrites the first. Per `hft-rules §8` ("Never silently drop, clamp, or 'fix' data without recording diagnostics"), this is unacceptable.
 
-This makes envelopes **idempotent**: the same envelope emitted twice has the same filename and `os.replace()` is a no-op. Eliminates FM-B1 collision.
+Under the revised rule:
+- **Byte-identical re-emission** (true duplicate) → same content_hash → same filename → `os.replace` is a no-op. Idempotency preserved for genuine duplicates.
+- **Different `metadata_json`** → different content_hash → different filenames → both envelopes land in inbox. Ingester processes first → SUCCESS. Processes second → PK violation on `experiment_fingerprint` → quarantine with `.error` sidecar. **Both envelopes preserved for operator review; neither silently lost.**
+
+Identity semantics unchanged: `experiment_fingerprint` remains the identity (PK). `content_hash` governs only the inbox filename.
 
 ### §3.6 envelope_version Dispatch
 
@@ -1990,6 +2059,81 @@ def rebuild(records_dir: Path, sqlite_path: Path) -> None:
 
 Rebuild does NOT regenerate Parquet files. If Parquet is missing, `artifacts`/`bulk_parquet_refs` rows still point to (missing) paths; `hft-ops ledger check` surfaces the inconsistency.
 
+### §5.7 Schema Migration Protocol (Round 13 — B6)
+
+**Problem**: §5.3 uses bare `CREATE TABLE ...` (not `IF NOT EXISTS` except for `schema_info`). When schema version bumps v1.0.0 → v1.1.0, opening an existing `ledger.sqlite` with v1.1.0 code fails with `table already exists`. There is no migration framework today.
+
+**Design**:
+
+1. **Schema version is recorded in `schema_info` row** (`key='schema_version'`, value = semver string like `"1.0.0"`).
+2. **Migrations live as numbered SQL files** at `hft-ops/src/hft_ops/ledger/migrations/NNN_*.sql`:
+   - `001_initial_v1_0_0.sql` — creates all 10 tables (this IS §5.3's DDL).
+   - `002_add_exchange_column.sql` — future Phase 11.5 for B8.
+   - `003_...` — etc.
+   Each file is immutable once committed. Never edit in place; always add a new numbered file.
+3. **Migration runner** (`hft_ops.ledger.migrations.apply_pending`): reads current `schema_info.schema_version`, finds all `migrations/NNN_*.sql` with N greater than current version, applies each in order within a single transaction, and updates `schema_info.schema_version` at the end.
+4. **CLI**: `hft-ops ledger migrate-schema [--to VERSION] [--dry-run]`. Default `--to` is "latest on disk."
+5. **Idempotency**: re-applying a migration is a no-op because `schema_info.schema_version` advances. `001_initial_v1_0_0.sql` uses `CREATE TABLE IF NOT EXISTS` for bootstrap robustness; later migrations use `ALTER TABLE` semantics.
+6. **Failure recovery**: if a migration fails mid-execution, the transaction rolls back (single-statement migrations only, OR explicit BEGIN/COMMIT for multi-statement). The `schema_info.schema_version` is NOT advanced, so a re-run picks up where it left off. For corrupted states, fall back to `hft-ops ledger rebuild --from-records --backup` (destroys SQLite, rebuilds from append-only JSON records; preserves the invariant that records/ is source of truth).
+
+**Reference implementation**:
+
+```python
+# hft_ops/ledger/migrations/__init__.py
+import re
+from pathlib import Path
+from typing import Iterator
+
+MIGRATIONS_DIR = Path(__file__).parent
+MIGRATION_FILENAME_RE = re.compile(r"^(\d{3})_.*\.sql$")
+
+def discover_migrations() -> Iterator[tuple[int, Path]]:
+    """Yield (version_number, migration_path) sorted by version."""
+    entries = []
+    for f in MIGRATIONS_DIR.glob("*.sql"):
+        m = MIGRATION_FILENAME_RE.match(f.name)
+        if m:
+            entries.append((int(m.group(1)), f))
+    entries.sort()
+    yield from entries
+
+def current_version(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'schema_migration_num'"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        return 0  # schema_info table doesn't exist yet (fresh DB)
+
+def apply_pending(conn: sqlite3.Connection) -> list[int]:
+    """Apply all migrations with number > current. Returns list of applied migration numbers."""
+    applied = []
+    curr = current_version(conn)
+    for num, path in discover_migrations():
+        if num <= curr:
+            continue
+        sql = path.read_text()
+        with conn:  # transaction
+            conn.executescript(sql)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('schema_migration_num', ?)",
+                (str(num),),
+            )
+        applied.append(num)
+    return applied
+```
+
+**Semver pairing**: `schema_info.schema_version` (e.g., `"1.0.0"`) is the PUBLIC version; `schema_info.schema_migration_num` (integer) is the INTERNAL monotonic counter. Every migration file updates `schema_version` when appropriate (minor bumps for additive, major for breaking).
+
+**Test** (§18.2 Migration, 4 tests):
+- Fresh DB → `apply_pending` runs all migrations → `schema_migration_num` matches highest on disk.
+- Partial DB (migrations 1-2 applied, 3 on disk) → `apply_pending` runs only 3.
+- Migration syntax error → transaction rolls back, `schema_migration_num` unchanged, re-run succeeds after fix.
+- Re-running a successful migration → no-op (idempotent).
+
+**What this replaces**: the previous design relied on `CREATE TABLE` without migration support, making any schema change a destructive rebuild. §5.7 makes schema evolution incremental and reversible (within SQLite limits — additive changes only; removing a column still requires rebuild).
+
 ---
 
 ## §6 — Fingerprint Alignment with Phase 3
@@ -2161,6 +2305,62 @@ A producer MUST NOT:
 - Delete or modify another producer's envelope.
 - Block on ingest completion (ingest is async from producer's perspective).
 
+### §7.1a Inbox Path Resolution (Round 13 — cross-repo producers)
+
+**Problem**: the parent monorepo at `/Users/knight/code_local/HFT-pipeline-v2/` is NOT git-tracked (per root CLAUDE.md). Producers live at various locations:
+- `hft-ops` (parent monorepo relative path)
+- `lob-model-trainer` (parent monorepo relative path)
+- `lob-backtester` (parent monorepo relative path)
+- `basic-quote-processor` (**standalone git repo** at `github.com/nagarx/basic-quote-processor.git`)
+- `feature-extractor-MBO-LOB` (parent monorepo relative path, but with standalone workspace)
+- future OPRA feature-extractor (**standalone git repo**)
+
+A standalone-repo producer (BQP, future OPRA) cloned on a different machine has no `hft-ops/ledger/inbox/` visible via relative path. Every producer must have a uniform way to discover the inbox location.
+
+**Resolution order** (producers implement this verbatim; deviations are bugs):
+
+1. **Explicit CLI argument `--ledger-inbox <absolute_path>`** — highest precedence. For scripts that want deterministic path regardless of environment.
+2. **Env var `HFT_OPS_LEDGER_INBOX=<absolute_path>`** — set by the orchestrator (`hft-ops run`) before spawning the producer subprocess. Matches the §14.5 `HFT_OPS_ORCHESTRATED=1` pattern.
+3. **Fallback** — if neither (1) nor (2) is set:
+   - If `HFT_OPS_ORCHESTRATED=1` is set AND inbox is unset → **HARD FAIL** with a precise error message. Rationale: orchestration explicitly promised envelope emission; silent skip under orchestration is a data-integrity hole.
+   - If `HFT_OPS_ORCHESTRATED` is unset → **WARN and skip** envelope emission. Rationale: standalone testing (e.g., `cargo test` inside BQP, or running `export_dataset` manually for a one-off) should not fail just because inbox isn't configured. Producer still writes its native artifacts (`metadata.json`, NPY files, etc.) — only the envelope is skipped.
+
+**Reference implementation** (Rust; identical semantics in Python):
+
+```rust
+pub fn resolve_inbox_path(cli_arg: Option<&std::path::Path>) -> Result<Option<std::path::PathBuf>, ProcessorError> {
+    if let Some(p) = cli_arg {
+        return Ok(Some(p.to_path_buf()));
+    }
+    if let Ok(env_val) = std::env::var("HFT_OPS_LEDGER_INBOX") {
+        return Ok(Some(std::path::PathBuf::from(env_val)));
+    }
+    // Orchestrated but inbox missing = HARD FAIL (fail-fast per hft-rules §5)
+    if std::env::var("HFT_OPS_ORCHESTRATED").as_deref() == Ok("1") {
+        return Err(ProcessorError::config(
+            "HFT_OPS_ORCHESTRATED=1 but HFT_OPS_LEDGER_INBOX is unset. \
+             Orchestrator must set HFT_OPS_LEDGER_INBOX when spawning producer subprocesses. \
+             This guard prevents silent envelope loss under orchestration.",
+        ));
+    }
+    // Standalone (e.g., `cargo test`, manual CLI without orchestration): WARN + skip
+    log::warn!(
+        "HFT_OPS_LEDGER_INBOX unset and not running under orchestration; \
+         envelope emission skipped (standalone mode). \
+         To enable, set HFT_OPS_LEDGER_INBOX=<abs_path> or pass --ledger-inbox."
+    );
+    Ok(None)
+}
+```
+
+**hft-ops orchestrator requirement**: whenever `hft-ops run` spawns a producer subprocess, it MUST set both `HFT_OPS_ORCHESTRATED=1` (preserving existing §14.5 convention) AND `HFT_OPS_LEDGER_INBOX=<abs_path_to>/hft-ops/ledger/inbox/`. This is enforced in `hft-ops/src/hft_ops/stages/base.py` (the subprocess-launch helper) alongside the existing env-var setup.
+
+**Test** (§18.2 inbox resolution, 4 tests):
+- CLI arg takes precedence over env var.
+- Env var used when CLI arg absent.
+- `HFT_OPS_ORCHESTRATED=1` + unset inbox → `ConfigError` raised.
+- No `HFT_OPS_ORCHESTRATED` + unset inbox → WARN log, function returns `None`; caller skips envelope emission.
+
 ### §7.1.1 Upstream Fingerprint Resolution API (Round 11 Agent B BQ7)
 
 **Problem**: a backtester at emit time knows the path to its signal directory (e.g., `lob-model-trainer/outputs/TLOB_E5_20260313T061500_...`) but NOT the `experiment_fingerprint` of the trainer that produced that signal. Without a programmatic way to look up the upstream fingerprint, lineage claims in the envelope degenerate into free-form strings (`source_name` only), and `§14.9` upstream integrity cannot be enforced.
@@ -2270,10 +2470,41 @@ Pseudocode (Python):
 
 ```python
 def ingest_all(ledger_dir: Path, batch_size: int = 100, dry_run: bool = False) -> IngestReport:
-    # Acquire exclusive lock
+    """Ingest pending/ first (retries for out-of-order upstreams), then inbox/.
+
+    Round 13 (D4 option α): every `hft-ops ledger ingest` call scans pending/
+    before inbox/. This gives UpstreamNotYetIngestedError envelopes a
+    deterministic retry cadence without a background daemon.
+    """
+    # Acquire exclusive lock (ingest is serialized; producers write inbox lock-free)
     with flock_exclusive(ledger_dir / "ledger.lock", timeout=5.0) as lock:
-        inbox = sorted((ledger_dir / "inbox").glob("*.json"))
         report = IngestReport()
+
+        # Step 1 (NEW): retry pending/ — envelopes waiting for upstream to arrive
+        pending_dir = ledger_dir / "pending"
+        pending_dir.mkdir(exist_ok=True)
+        for envelope_path in sorted(pending_dir.glob("*.json")):
+            # Age-out check: > 24h → escalate to quarantine
+            age_hours = (time.time() - envelope_path.stat().st_mtime) / 3600
+            if age_hours > 24:
+                _escalate_pending_to_quarantine(
+                    envelope_path, ledger_dir,
+                    reason=f"upstream never arrived after {age_hours:.1f}h",
+                )
+                report.record(IngestOneResult.age_out_quarantined(envelope_path))
+                continue
+            # Retry: move back to inbox, then re-run ingest_one on it
+            retry_target = ledger_dir / "inbox" / envelope_path.name
+            os.replace(envelope_path, retry_target)
+            try:
+                result = ingest_one(retry_target, ledger_dir, dry_run=dry_run)
+                report.record(result)
+            except Exception as e:
+                log.exception(f"Pending-retry failed: {retry_target.name}")
+                report.error(retry_target, e)
+
+        # Step 2: process inbox (the main ingest path)
+        inbox = sorted((ledger_dir / "inbox").glob("*.json"))
         for envelope_path in inbox[:batch_size]:
             try:
                 result = ingest_one(envelope_path, ledger_dir, dry_run=dry_run)
@@ -2301,18 +2532,22 @@ def ingest_one(envelope_path: Path, ledger_dir: Path, dry_run: bool = False) -> 
     if dry_run:
         return IngestOneResult.would_insert(validated)
 
-    # Step 2: append-only JSON record (atomic tmp+rename)
+    # Step 2: append-only JSON record (atomic tmp+rename). Canonical form comparison for idempotency.
+    # Round 13 (D3/B4 fix): both sides compared as canonical_json_dumps(validated.model_dump()) —
+    # NOT raw inbox bytes. Raw inbox file may have whitespace/key-order variation even if semantically
+    # identical; Pydantic roundtrip canonicalizes. See §3.3.6 invariants.
     record_path = ledger_dir / "records" / f"{validated.experiment_id}.json"
+    canonical_new = canonical_json_dumps(validated.model_dump(by_alias=False, exclude_none=False))
     if record_path.exists():
-        # Idempotent: compare content byte-for-byte (canonical JSON via §3.3.7).
-        if record_path.read_bytes() == envelope_path.read_bytes():
+        canonical_existing = record_path.read_text()
+        if canonical_existing == canonical_new:
             envelope_path.unlink()
             audit_log_append(ledger_dir, validated, result="duplicate_idempotent",
                              duration_ms=int(1000 * (time.perf_counter() - t0)))
             return IngestOneResult.duplicate_idempotent(validated)
         else:
-            return quarantine(envelope_path, f"Conflict: record {validated.experiment_id} exists with different content")
-    atomic_write_json(record_path, envelope)
+            return quarantine(envelope_path, f"Conflict: record {validated.experiment_id} exists with different canonical content")
+    atomic_write_text(record_path, canonical_new)  # write the canonical form, not the raw inbox bytes
 
     # Step 3: Parquet files (already written by producer; verify paths exist but do not block)
     for parquet_ref in validated.bulk_parquet:
@@ -2326,7 +2561,12 @@ def ingest_one(envelope_path: Path, ledger_dir: Path, dry_run: bool = False) -> 
     apply_pragmas(conn)
     try:
         with conn:  # auto-BEGIN / COMMIT on success / ROLLBACK on exception
-            insert_experiment(conn, validated)       # §7.3.1 INSERT template
+            # §14.8 norm-integrity + §14.9 upstream-integrity run BEFORE INSERT so they
+            # can raise UpstreamNotYetIngestedError and route the envelope to pending/
+            # WITHOUT modifying SQLite state.
+            check_normalization_integrity(validated, conn)   # §14.8
+            check_upstream_integrity(validated, conn)        # §14.9
+            insert_experiment(conn, validated)               # §7.3.1 INSERT template (runtime-generated from Pydantic fields)
             insert_metrics(conn, validated)
             insert_gates(conn, validated)
             insert_artifacts(conn, validated)
@@ -2339,6 +2579,21 @@ def ingest_one(envelope_path: Path, ledger_dir: Path, dry_run: bool = False) -> 
                 "UPDATE experiments SET cohort_hash = ? WHERE experiment_fingerprint = ?",
                 (cohort_hash, validated.experiment_fingerprint),
             )
+    except UpstreamNotYetIngestedError as e:
+        # SOFT failure: route to pending/ for later retry (§14.8 / D4)
+        # Rollback the JSON record we just wrote — it will be re-written when pending retries succeed
+        record_path.unlink(missing_ok=True)
+        pending_path = ledger_dir / "pending" / envelope_path.name
+        pending_path.parent.mkdir(exist_ok=True)
+        os.replace(envelope_path, pending_path)
+        _write_waiting_sidecar(pending_path, missing_fingerprints=_extract_missing_fps(e, validated))
+        audit_log_append(ledger_dir, validated, result="pending_upstream",
+                         duration_ms=int(1000 * (time.perf_counter() - t0)))
+        return IngestOneResult.pending_upstream(validated, str(e))
+    except NormalizationStatsMismatchError as e:
+        # HARD failure: real train/inference drift — quarantine with forensic sidecar (§14.8)
+        record_path.unlink(missing_ok=True)
+        return quarantine(envelope_path, f"NormalizationStatsMismatch: {e}")
     except sqlite3.IntegrityError as e:
         # PK violation = experiment_fingerprint already present (already ingested)
         # Transaction auto-rolled back by context manager on exception
@@ -2368,7 +2623,52 @@ def ingest_one(envelope_path: Path, ledger_dir: Path, dry_run: bool = False) -> 
 
 ### §7.3.1 SQL INSERT Templates (Normative)
 
-Each `insert_*` helper in `ingest_one` follows a consistent template. Values are bound via `?` placeholders (never string-concat — SQL injection guard AND correct NULL handling).
+**Round 13 (B5)**: INSERT statements are **generated at runtime from the Pydantic model field list** — NOT hard-coded. The templates below are for DOCUMENTATION only. A schema change (e.g., adding `exchange` column in Phase 11.5 without touching the INSERT) silently fills the wrong column under hard-coded INSERTs because placeholders bind positionally. Runtime generation from the Pydantic field ordering eliminates this class of bug.
+
+```python
+# hft_ops/ledger/sql_templates.py
+
+def build_insert_stmt(table: str, ordered_fields: list[str]) -> str:
+    """Generate INSERT statement from a Pydantic model's field order.
+
+    Invariant: placeholder count == len(ordered_fields) == target table column count.
+    Verified by test_insert_statement_column_count_matches_schema at §18.2.
+    """
+    columns = ", ".join(ordered_fields)
+    placeholders = ", ".join("?" for _ in ordered_fields)
+    return f"INSERT INTO {table} ({columns}) VALUES ({placeholders});"
+
+# At module load time, freeze the templates:
+INSERT_EXPERIMENTS_SQL = build_insert_stmt(
+    "experiments",
+    list(Envelope.model_fields.keys())  # order from Pydantic = order from pipeline_contract.toml codegen
+    + ["cohort_hash", "json_record_path", "ingested_at"]  # ingester-set fields appended in fixed order
+)
+INSERT_METRICS_SQL = build_insert_stmt("metrics", [...])
+# ... etc. for each child table
+```
+
+**Meta-test** (`tests/test_schema_parity.py`):
+```python
+def test_insert_statement_column_count_matches_schema():
+    """Guard against silent column drift: INSERT placeholders must match DDL columns."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA_SQL)
+    for table_name, insert_stmt in KNOWN_INSERTS.items():
+        ddl_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+        # Skip auto-increment PKs + CHECK-generated cols
+        stmt_cols = extract_columns_from_insert(insert_stmt)
+        # Every stmt column must exist in DDL; placeholder count must match
+        placeholder_count = insert_stmt.count("?")
+        assert len(stmt_cols) == placeholder_count, (
+            f"{table_name} INSERT has {len(stmt_cols)} cols but {placeholder_count} placeholders"
+        )
+        assert stmt_cols.issubset(ddl_cols), (
+            f"{table_name} INSERT references columns not in DDL: {stmt_cols - ddl_cols}"
+        )
+```
+
+Below are the **column orderings** that runtime generation must produce. Any deviation means the Pydantic model or DDL drifted. Values are bound via `?` placeholders (never string-concat — SQL injection guard AND correct NULL handling).
 
 ```sql
 -- insert_experiment: ONE row per envelope
@@ -3368,17 +3668,30 @@ Extraction → raw_analysis → dataset_analysis → validation → training →
 
 **Invariant**: for any `record_type='backtest'` envelope `B` with `upstream_experiment_ids = [T_id, ...]`, the backtester's `signal_provenance.normalization_stats_sha256` MUST byte-equal the trainer's `training_info.normalization_stats_sha256` where the trainer is `experiments.experiment_id == T_id`.
 
-**Enforcement**: §7.6.1 rule 10 + a new dedicated check at ingest time:
+**Enforcement**: §7.6.1 rule 10 + a dedicated check at ingest time. **Round 13 refinement (D4)**: the check distinguishes two failure modes — "upstream hasn't arrived yet" (soft retry via `pending/`) vs "upstream stats mismatch" (hard quarantine). These MUST NOT share an exception type.
 
 ```python
+class UpstreamNotYetIngestedError(LookupError):
+    """Soft failure: upstream producer's envelope hasn't been ingested yet.
+    Envelope routed to pending/; retried on every subsequent `hft-ops ledger
+    ingest` call; escalates to quarantine after age-out (default 24h)."""
+
+class NormalizationStatsMismatchError(ValueError):
+    """HARD failure: backtester's stats hash differs from trainer's stats hash.
+    Envelope immediately quarantined; indicates real train/inference drift."""
+
 def check_normalization_integrity(validated: Envelope, conn: sqlite3.Connection) -> None:
-    """Raise IntegrityError if backtest's norm stats differ from its trainer's."""
+    """Raise UpstreamNotYetIngestedError if trainer is absent (retry).
+    Raise NormalizationStatsMismatchError if hashes differ (quarantine).
+    """
     if validated.record_type != "backtest":
         return
+    if validated.producer == "legacy-migrator":
+        return  # §13.1b legacy-migrator exemption
     if validated.signal_provenance is None or validated.signal_provenance.normalization_stats_sha256 is None:
         if validated.signal_provenance and validated.signal_provenance.normalization_method in (None, "none"):
             return  # trainer used raw features — no stats to check
-        raise IntegrityError("backtest missing signal_provenance.normalization_stats_sha256")
+        raise NormalizationStatsMismatchError("backtest missing signal_provenance.normalization_stats_sha256 despite non-'none' normalization_method")
 
     trainer_fp = validated.signal_provenance.trainer_fingerprint
     row = conn.execute(
@@ -3386,22 +3699,32 @@ def check_normalization_integrity(validated: Envelope, conn: sqlite3.Connection)
         (trainer_fp,)
     ).fetchone()
     if row is None:
-        raise IntegrityError(f"trainer fingerprint {trainer_fp[:8]}... not in ledger")
+        # SOFT failure: upstream not yet in ledger — route to pending/
+        raise UpstreamNotYetIngestedError(
+            f"trainer fingerprint {trainer_fp[:8]}... not yet in ledger; envelope will retry on next ingest call"
+        )
     trainer_meta = json.loads(row[0])
     trainer_sha = trainer_meta.get("training_info", {}).get("normalization_stats_sha256")
     if trainer_sha != validated.signal_provenance.normalization_stats_sha256:
-        raise IntegrityError(
+        # HARD failure: real hash mismatch — train/inference drift detected
+        raise NormalizationStatsMismatchError(
             f"normalization_stats_sha256 mismatch: trainer={trainer_sha[:8] if trainer_sha else 'NULL'}, "
             f"backtest={validated.signal_provenance.normalization_stats_sha256[:8]}. "
-            f"This indicates train/inference stats drift under T15; backtest would produce silently-wrong signals."
+            f"Train/inference drift detected under T15; backtest would produce silently-wrong signals."
         )
 ```
 
-**Rationale**: T15 "Raw Rust, Variable Python" means normalization is the **single largest source of silent train/inference divergence**. Without this check, two backtest envelopes with identical fingerprints could consume DIFFERENT normalization stats (e.g., if the trainer's checkpoint was re-saved with a different seed and stats got reshuffled). The fingerprint does NOT include normalization_stats because stats are runtime-computed, not config — so content-addressed identity cannot catch this class of bug. §14.8 closes the gap.
+**Ingest dispatch** (refined in §7.3):
+- `UpstreamNotYetIngestedError` → move envelope to `hft-ops/ledger/pending/{content_hash}.json` + `.waiting` sidecar listing missing fingerprints. Next `hft-ops ledger ingest` call retries pending/ first (step 1 of the algorithm). Age > 24h → escalate to quarantine with `.error = "upstream never arrived"`.
+- `NormalizationStatsMismatchError` → immediate quarantine with `.error` sidecar containing both hashes for forensic review.
 
-**Test** (§18.2 Normalization integrity, 2 new tests):
+**Rationale**: T15 "Raw Rust, Variable Python" means normalization is the **single largest source of silent train/inference divergence**. Without this check, two backtest envelopes with identical fingerprints could consume DIFFERENT normalization stats (e.g., if the trainer's checkpoint was re-saved with a different seed and stats got reshuffled). The fingerprint does NOT include normalization_stats because stats are runtime-computed, not config — so content-addressed identity cannot catch this class of bug. §14.8 closes the gap, AND distinguishes ordering races (harmless, retry) from real drift (fatal, quarantine) so operators aren't drowned in false alarms during sweeps.
+
+**Tests** (§18.2 Normalization integrity + pending retry, 4 tests):
 - Insert trainer envelope with `normalization_stats_sha256 = "abc..."`; then ingest backtest with matching sha → passes.
-- Ingest backtest with MISmatching sha → `IntegrityError`; ingest aborts; envelope quarantined with `.error` explaining the drift.
+- Ingest backtest with MISmatching sha → `NormalizationStatsMismatchError` → quarantine; `.error` sidecar contains both hashes.
+- Ingest backtest BEFORE trainer → `UpstreamNotYetIngestedError` → `pending/`. Then ingest trainer → next ingest call retries pending/ → backtest succeeds.
+- Ingest backtest with upstream never arriving → after simulated 24h, escalates from `pending/` to quarantine.
 
 ### §14.9 Upstream Fingerprint Integrity (Round 11 Agent B BQ7)
 
@@ -3415,31 +3738,101 @@ See §7.1.1 for the producer-side API that resolves upstream fingerprints at emi
 
 ## §15 — Implementation Phases (Phase 11-14+)
 
-### §15.1 Phase 11: Ledger v2 Core + Migration (4 weeks)
+### §15.1 Phase 11: Ledger v2 Core + Migration (8-10 weeks, weekly go/no-go gates)
 
-**Timeline note (Round 10):** bumped from 3 → 4 weeks to absorb cross-language envelope codegen (Python Pydantic + Rust serde), SQLite lock-contention hardening under concurrency, and the four parallel subprocess producer rollouts (BQP, MBO extractor, trainer, backtester).
+**Round 13 timeline correction (D1)**: the original "3 weeks" (Round 9) and "4 weeks" (Round 10 bump) estimates were both optimistic. Agent P1 (Round 12) mid-estimate for Python-producers-only scope: ~355 focused hours ≈ 8-9 weeks at 40h/wk; high-end ~11 weeks. State the range honestly to avoid schedule pressure cutting Tier-1 invariants. Each week ends with an explicit go/no-go gate (§15.1a) — if a gate fails, re-scope the next week rather than force the schedule.
+
+**Scope (Round 13 — D1 descope)**: Python producers only in Phase 11. Rust producer wiring (BQP envelope emit, MBO extractor envelope emit) deferred to Phase 11.5. This descope is NOT a quality compromise — it's an explicit acknowledgment that Rust/Python canonical JSON parity (the single largest hidden risk per Rounds 10-12) must be DE-RISKED in Phase 11 Week 1 via fixture-based parity tests, but WIRING the Rust producers to actually emit envelopes can happen in Phase 11.5 once parity is proven.
+
+**Producers covered in Phase 11**:
+- Trainer (`lob-model-trainer`, Python) — H21 in dependency DAG
+- Backtester (`lob-backtester`, Python) — H22, required to exercise §14.8 normalization-integrity gate end-to-end
+
+**Producers deferred to Phase 11.5 (≈ 2 weeks later)**:
+- BQP (`basic-quote-processor`, Rust) — H23
+- MBO extractor (`feature-extractor-MBO-LOB`, Rust) — H24
+- Evaluator (`hft-feature-evaluator`, Python) — lower priority; §14.8 doesn't depend on it
+
+**Tier-2 items promoted to Phase 11 Week 1 (schema-affecting, cannot defer)**:
+- B1 Z-timezone pattern on ISO 8601 fields (§3.2 amended) — schema-breaking if deferred, invalidates fixtures
+
+**Tier-2 items confirmed deferred to Phase 11.5 (additive, backward-compatible)**:
+- B8 `exchange` column (schema v1.1.0 minor bump; additive)
+- C-FF6 JSON-Schema-from-TOML codegen + CI drift-check
+- C-FF7 `metadata_json.<producer>.*` namespace warn rule
+- C-SC8 cross-repo contract-bump coordination playbook
 
 **Deliverables**:
-- Contract-first envelope schema in `pipeline_contract.toml` (envelope v1 JSON Schema, MetricKey, GateKey).
-- Codegen → `hft_contracts/orchestration.py` Pydantic model + Rust `hft_contracts::orchestration` struct.
-- **Canonical JSON serialization library** (shared Python + Rust) — see §3.3.7 — so the cross-language fingerprint computation stays byte-identical.
+- Contract-first envelope schema in `pipeline_contract.toml` (envelope v1 JSON Schema, MetricKey, GateKey, with Z-timezone patterns per B1).
+- Python codegen → `hft_contracts/orchestration.py` Pydantic model + MetricKey/GateKey enums + canonical JSON library.
+- **Rust `hft_contracts_rs` crate skeleton** — single-package layout per §2.5.1; hand-maintained `Envelope` struct + `SCHEMA_HASH` const + canonical JSON + cross-lang fixtures. **Verified by both SCHEMA_HASH check AND golden serialization test.** Rust producer wiring NOT in scope.
+- Cross-lang canonical JSON fixtures (9 cases including datetime/Path/None-vs-null fallbacks) — CI parity gate.
 - MetricKey + GateKey enums in `hft-contracts` (underscore form registry per §4.5; §4.2 registry parsed by TOML loader).
-- SQLite schema (**10 tables** after Round 10 consolidation) + PRAGMAs (WAL, synchronous=NORMAL, foreign_keys=ON).
+- SQLite schema (10 tables) + PRAGMAs (WAL, synchronous=NORMAL, foreign_keys=ON) + **§5.7 migration protocol** (numbered migrations, `hft-ops ledger migrate-schema` CLI, rollback on mid-migration failure).
 - Append-only `ingest.log` JSONL file (replaces the previously-proposed `ingest_audit` table).
-- CLI: `hft-ops ledger {ingest, query, show, compare, diff, list, rebuild, check, backup, quarantine, audit-log, note, tag, render-indexes, regenerate-parquet}`.
+- **Inbox path resolution** (§7.1a): `HFT_OPS_LEDGER_INBOX` env var + `--ledger-inbox` CLI arg + orchestrated-fail-fast / standalone-warn fallback.
+- **`pending/` directory** for out-of-order ingest (§14.8 / D4): `UpstreamNotYetIngestedError` routes to pending/; `ingest_all` retries pending/ first; 24h age-out to quarantine.
+- CLI: `hft-ops ledger {ingest, query, show, compare, diff, list, rebuild, check, backup, quarantine, audit-log, note, tag, render-indexes, pending}`.
 - Python SDK: `Ledger` class + helpers; optional `pandas` passthrough.
 - Migration CLI: 4-step backfill of 34 retroactive records (§13.1).
-- **Legacy → envelope-v0 field mapping** (§13.1b) with tests that migrate 34/34 records byte-identically.
-- **Post-ingest debounced index render** (§4.6) replaces eager render.
-- **Rollback protocol** (§7.4.1) — partial commit recovery documented and tested.
-- **Test coverage: ≥ 40 new hft-ops tests** (ingest, query, migration, failure recovery, rebuild, atomic writes, rollback, fault-injection).
+- **Legacy → envelope-v0 field mapping** (§13.1b) with tests that migrate 34/34 records with byte-identical fingerprint preservation.
+- **Post-ingest debounced index render** (§4.6) replaces eager render; `flock`-based inter-process coordination.
+- **Rollback protocol** (§7.4.1) — partial commit recovery; CLI `check --orphaned-records` + `heal --from-orphans` + `rebuild --from-records --backup`.
+- **Runtime-generated INSERT statements** (§7.3.1 / B5) — from Pydantic field ordering; meta-test guards against column drift.
+- **Test coverage: ≥ 80 new tests** (40+ hft-ops + 15 hft-contracts + 10 trainer + 10 backtester + 5 cross-lang parity).
 
-**Success criteria**:
-- One `hft-ops run` produces a non-retro ledger record end-to-end.
-- All 34 legacy records migrated (fingerprints preserved; §13.1b mapping table verifies byte-for-byte).
-- Query Q1 ("all TLOB experiments with test IC > 0.05") returns in < 100 ms p95 on 1000-record ledger.
-- Failure modes §12.1.1-§12.1.10 each verified by at least one fault-injection test.
+**Success criteria (Phase 11 complete)**:
+- One `hft-ops run` (trainer → backtester sequence) produces TWO non-retro ledger records end-to-end.
+- §14.8 normalization-integrity gate verified end-to-end: matching hashes pass; mismatched hashes quarantine with forensic sidecar.
+- §14.9 upstream-integrity + `pending/` retry verified: out-of-order ingest routes to pending/, subsequent ingest resolves.
+- All 34 legacy records migrated with byte-identical fingerprints preserved.
+- Query Q1 ("all TLOB experiments with test IC > 0.05") returns in < 100 ms p95 on 1000-record synthetic ledger.
+- All 10 §12.1 failure modes covered by `test_fm_NN_*` tests (§18.3 mapping).
 - `sqlite3 ledger.sqlite < schema.sql` parses cleanly (Round 10 regression — DDL syntax-correctness gate).
+- `test_rust_envelope_serialization_matches_python_golden` passes (Round 13 D2 verification).
+- `test_schema_hash_verify_catches_toml_drift` passes.
+
+### §15.1a Phase 11 Week 1 Bootstrap Order (Round 13 — B7)
+
+**Problem**: the test fixtures at §18.1b assume the Pydantic envelope model exists. The Pydantic model is codegen'd from `[orchestration.envelope]` in `pipeline_contract.toml`. That section does not exist yet. Chicken-and-egg.
+
+**Resolution**: day-by-day Week 1 order. Strict sequential dependencies.
+
+**Day 1 — Schema freeze in TOML** (resolves B1, D2, unblocks everything else):
+- Add `[orchestration.envelope]` section to `pipeline_contract.toml` with full v1 JSON Schema (52 top-level properties, including B1 Z-timezone regex patterns).
+- Add `[orchestration.metric_keys]` with 44 keys (§4.2 v1.2 registry already spec'd).
+- Add `[orchestration.gate_keys]` with 9 keys (§4.5).
+- Add `[orchestration.feature_schemas.equity_v2_2]`, `[orchestration.feature_schemas.off_exchange_1_0]` declarations (§4.4-ish extension).
+- Verify: `tomllib.loads(pipeline_contract.toml)` produces a valid `orchestration.*` tree.
+- Gate: schema is frozen; no changes this week without reset to Day 1.
+
+**Day 2 — Python codegen extension**:
+- Extend `contracts/generate_python_contract.py` to emit `hft_contracts/orchestration/envelope.py` (Pydantic model), `metric_keys.py` (enum), `gate_keys.py` (enum) from the TOML.
+- Run `python contracts/generate_python_contract.py` → verify output files parse as Python.
+- `from hft_contracts.orchestration import Envelope; Envelope` succeeds.
+
+**Day 3 — Hand-crafted golden fixture**:
+- By hand, construct ONE valid envelope JSON conforming to every §3.2 field (including nested `lineage[]`, `artifacts[]`, `bulk_parquet[]`, `metrics[]`, `gates[]`, `training_info`, `signal_provenance`).
+- Validate it: `Envelope.model_validate_json(sample.read_text())` must succeed.
+- Save to `hft-contracts/tests/fixtures/envelopes/golden/01_complete.json`.
+- Compute canonical form: `canonical_json_dumps(Envelope.model_validate_json(sample).model_dump())` → save as `golden/01_complete_canonical.json`.
+- These TWO files become the cross-lang parity ground truth for Day 5.
+
+**Day 4 — Parameterize remaining fixtures**:
+- Generate 5 more fixtures derived from the canonical golden: `02_minimal_required.json` (only required fields), `03_multi_symbol.json` (symbols_json set), `04_missing_optional.json` (null-valued optionals), `05_legacy_migrator.json` (producer=legacy-migrator with `normalization_*` NULL), `06_pending_upstream.json` (backtest with valid upstream_fingerprint but trainer not-yet-ingested).
+- Plus 9 canonical_json fixtures: `01_simple.json` through `09_none_vs_null.json`.
+- Plus 7 invalid fixtures (§18.1b).
+
+**Day 5 — Rust crate skeleton + parity test**:
+- Create `hft-contracts/Cargo.toml` + `hft-contracts/rust/lib.rs` + `rust/orchestration/envelope.rs` (hand-written struct mirroring the Pydantic model).
+- Add `SCHEMA_HASH` const (populated later).
+- Implement `canonical_json_dumps` in Rust (§3.3.6).
+- Write `rust/tests/envelope_golden.rs` that deserializes `golden/01_complete.json`, re-serializes, asserts byte-equal against `golden/01_complete_canonical.json`.
+- Run `cargo test -p hft_contracts_rs` — passes.
+- Run `contracts/verify_rust_envelope_schema.py` — computes TOML hash, writes `SCHEMA_HASH` const, commits.
+- **Week 1 exit gate**: both tests pass. If parity fails, STOP: defer all Rust work to Phase 11.5 and re-plan Weeks 2-4 without Rust dependencies.
+
+**Week 1 total scope**: ~40-50 hours of focused work (fits standard 40h/wk if no surprises; high confidence achievable).
 
 ### §15.2 Phase 12: Sweep v2 + Parallel Execution (2 weeks)
 
@@ -3704,6 +4097,38 @@ hft-ops/tests/fixtures/ledger/
 - Backtester envelope references trainer hash
 - Lineage walks BQP → trainer → backtester
 
+**Cross-language parity tests** (~8, Round 13 — D2 verification):
+- `test_rust_envelope_serialization_matches_python_golden` — load canonical golden envelope in Rust; re-serialize via `hft_contracts_rs::canonical_json::dumps`; assert byte-equal to fixture. **Catches Rust struct drift.**
+- `test_python_envelope_serialization_matches_golden` — same test in Python, asserting stability.
+- `test_schema_hash_verify_catches_toml_drift` — modify TOML, recompute hash; assert mismatches stored Rust `SCHEMA_HASH`.
+- `test_canonical_json_fixtures_01_through_09` — 9 cross-lang fixtures (simple, nested, unicode, float_int, nan_rejected, large_array, datetime_fallback, path_fallback, none_vs_null); Python and Rust both produce identical SHA-256 on each.
+
+**Normalization integrity tests** (~4, Round 13 — D4):
+- `test_backtest_stats_hash_match_passes` — trainer envelope `normalization_stats_sha256="abc..."` ingested; backtest with matching hash → succeeds.
+- `test_backtest_stats_hash_mismatch_quarantined` — mismatch → `NormalizationStatsMismatchError` → quarantine; `.error` sidecar contains both hashes.
+- `test_backtest_upstream_not_ingested_routes_to_pending` — backtest ingested before trainer → `UpstreamNotYetIngestedError` → `pending/{content_hash}.json`.
+- `test_pending_retry_succeeds_after_trainer_arrives` — ingest trainer after backtest is pending; next `ingest_all` call retries pending/ → backtest succeeds; `pending/` is empty.
+
+**Pending retry tests** (~3):
+- `test_pending_age_out_escalates_to_quarantine` — simulate 24.5h old pending file via `os.utime`; next ingest escalates to quarantine.
+- `test_pending_retry_cli_explicit` — `hft-ops ledger pending retry-all` processes all pending envelopes.
+- `test_pending_sidecar_preserved` — `.waiting` sidecar lists missing fingerprints; preserved across age-out.
+
+**Inbox resolution tests** (~4, Round 13 — B2):
+- `test_cli_arg_precedence_over_env` — `--ledger-inbox=/tmp/x` overrides `HFT_OPS_LEDGER_INBOX=/tmp/y`.
+- `test_env_var_used_when_cli_absent`.
+- `test_orchestrated_missing_inbox_fails` — `HFT_OPS_ORCHESTRATED=1` + unset `HFT_OPS_LEDGER_INBOX` → `ConfigError` raised.
+- `test_standalone_missing_inbox_warns_and_skips` — neither env var set + unset inbox → WARN log + envelope emission skipped.
+
+**Schema migration tests** (~4, Round 13 — B6):
+- `test_migration_fresh_db_applies_all` — empty DB + 3 migration files → `schema_migration_num=3` after `apply_pending`.
+- `test_migration_partial_db_applies_delta` — `schema_migration_num=2` + 3 on disk → only migration 003 runs.
+- `test_migration_syntax_error_rollback` — broken SQL in migration 003 → `schema_migration_num=2` (unchanged) after failure; re-run with fixed SQL succeeds.
+- `test_migration_idempotent_replay` — running `apply_pending` twice is a no-op on second call.
+
+**Schema parity test** (~1, Round 13 — B5):
+- `test_insert_statement_column_count_matches_schema` — for each `INSERT_*_SQL` runtime-generated from Pydantic fields, assert placeholder count equals target DDL column count AND column names are a subset of DDL columns.
+
 ### §18.3 Fault Injection Testing
 
 Critical for reliability. Use `pytest` + `unittest.mock.patch`:
@@ -3726,6 +4151,33 @@ def test_ingest_kill_after_json_record(tmp_path):
 ```
 
 Similar tests for kill-after-Parquet, kill-after-SQL-BEGIN, etc.
+
+**Round 13 — explicit failure-mode-to-test-name mapping** (covers §12.1 completeness metric #8 "10 of 10 failure modes have tests"):
+
+| §12.1 ID | Failure mode | Test name (in `tests/test_fault_injection.py`) |
+|---|---|---|
+| FM-01 | Producer writes envelope, ingester crashes before SQLite commit | `test_fm_01_kill_after_json_record_rebuild_recovers` |
+| FM-02 | SQLite commits, markdown render crashes | `test_fm_02_render_crash_does_not_fail_ingest` |
+| FM-03 | Producer writes inbox, Parquet missing from disk | `test_fm_03_parquet_missing_warn_only_proceeds` |
+| FM-04 | Two concurrent ingesters (flock contention) | `test_fm_04_concurrent_ingest_serialized_by_flock` |
+| FM-05 | Out-of-order ingest (backtest before trainer) | `test_fm_05_out_of_order_ingest_pending_then_resolves` |
+| FM-06 | Normalization-stats mismatch (train vs inference drift) | `test_fm_06_norm_stats_mismatch_quarantined` |
+| FM-07 | Schema migration syntax error mid-apply | `test_fm_07_migration_rollback_preserves_version` |
+| FM-08 | Inbox envelope with truncated JSON | `test_fm_08_malformed_json_quarantined` |
+| FM-09 | Duplicate `experiment_fingerprint` (re-emission race) | `test_fm_09_duplicate_pk_idempotent_audit` |
+| FM-10 | `records/{id}.json` exists but SQLite row missing (state A) | `test_fm_10_orphaned_record_heal_recovers` |
+
+**Meta-test** `test_all_failure_modes_have_tests`:
+```python
+def test_all_failure_modes_have_tests():
+    """Enforce §12.1 coverage: every failure mode must have a named test."""
+    import inspect, tests.test_fault_injection as tfi
+    test_names = {name for name, _ in inspect.getmembers(tfi, inspect.isfunction) if name.startswith("test_fm_")}
+    expected = {f"test_fm_{nn:02d}_" for nn in range(1, 11)}
+    for prefix in expected:
+        matches = [n for n in test_names if n.startswith(prefix)]
+        assert matches, f"Missing test for failure mode starting with {prefix}"
+```
 
 ### §18.4 Performance Tests
 
@@ -3818,6 +4270,12 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | **cohort_hash** | SHA-256 derived hash that EXCLUDES symbol + data_manifest; stored on `experiments`. Enables cross-symbol cohort queries (`WHERE cohort_hash = ?`). |
 | **symbols_json** | JSON-array column on `experiments`. NULL for single-symbol experiments; non-NULL for multi-symbol pooled training. |
 | **ingest.log** | Append-only JSONL audit file at `hft-ops/ledger/ingest.log` (replaces the previously-proposed `ingest_audit` SQLite table — Round 10). Rotated monthly. Queryable via `hft-ops ledger audit-log`. |
+| **`pending/`** | `hft-ops/ledger/pending/` — directory for envelopes whose upstream has not yet been ingested (§14.8 `UpstreamNotYetIngestedError`). Scanned first by every `ingest_all` call; age-out to quarantine at 24h. Round 13 D4 addition. |
+| **`UpstreamNotYetIngestedError`** | Soft ingest failure signaling the upstream producer's envelope hasn't arrived yet. Routes to `pending/`, retried on subsequent ingest calls, escalates to quarantine after 24h. NOT to be conflated with `IntegrityError` (hard failure) or `NormalizationStatsMismatchError` (real drift, immediate quarantine). |
+| **`SCHEMA_HASH`** | `pub const` in `hft_contracts_rs::orchestration::envelope` that equals `sha256(canonical_json(envelope_schema_from_toml))`. CI-verified by `contracts/verify_rust_envelope_schema.py`. Catches TOML-side drift. Round 13 D2 addition. |
+| **Golden envelope fixture** | `tests/fixtures/envelopes/golden/01_complete.json` + its canonical form. Rust golden-serialization test asserts Rust `Envelope` struct re-serialization is byte-equal. Catches Rust-side struct drift (complements SCHEMA_HASH which catches TOML-side drift). |
+| **Canonical form of envelope** | `canonical_json_dumps(Envelope.model_validate_json(raw).model_dump())` — Pydantic roundtrip through canonical JSON. Used for `records/{id}.json` byte-storage AND for the idempotent byte-compare at ingest (§7.3 amended). Distinct from the raw inbox bytes which may have non-canonical whitespace/key-order variation. |
+| **HFT_OPS_LEDGER_INBOX** | Env var set by the orchestrator to the absolute path of `hft-ops/ledger/inbox/`. Producers read this to know where to write envelopes. Missing under `HFT_OPS_ORCHESTRATED=1` → fail-fast; missing in standalone mode → warn-skip. Round 13 B2 addition. |
 
 ---
 
@@ -3845,6 +4303,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 | Draft v1 | 2026-04-15 | Initial draft synthesizing 9 validation rounds (~20 agent reports). |
 | Draft v1.1 — Round 10 | 2026-04-15 | Applied Round 10 validation findings (4 parallel agents: consistency / completeness / correctness / better-alternatives). See amended change list below. |
 | Draft v1.2 — Round 11 | 2026-04-15 | Applied Round 11 Tier-1 findings (4 parallel agents: radical alternatives / data-flow integrity / 5-year decay / code-reality alignment). All 7 Tier-1 items fixed. See Round 11 Tier-1 Amendments below. |
+| Draft v1.3 — Round 12/13 | 2026-04-15 | Applied Round 12 pre-implementation validation (3 agents: sequencing, cross-phase integration, implementation-surface) + Round 13 self-stress-test refinements. Added 8 blockers (B1-B8) + 4 decision amendments (D1-D4). See Round 12/13 Amendments below. |
 
 ### Round 10 Amendments (v1 → v1.1)
 
@@ -3883,6 +4342,63 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 - §4.5 TOML: all GateKeys use underscore form (no dot).
 - §3.2 JSON Schema: parses as Draft-07 JSON; source_commit pattern accepts both 7-char and 40-char SHAs AND the `not_git_tracked` sentinel.
 - §6.4 SQL blocks: no trailing commas; reference only valid columns.
+
+### Round 12/13 Amendments (v1.2 → v1.3)
+
+**Round 12 agents (sequencing / cross-phase / implementation-surface) + Round 13 self-stress-test** produced 8 blockers and 4 decision amendments. All applied before commit.
+
+**8 blockers resolved:**
+
+1. **B1 Z-timezone pattern** — §3.2 `created_at`/`finalized_at`/`heartbeat_at`/`override_at` now carry `pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"` (Z-only, rejects `+00:00` offset form). Prevents Parquet `yyyy_mm` partition drift at midnight-UTC boundaries and markdown-render timezone ambiguity. Promoted from Tier-2 to Phase 11 Week 1 (schema-breaking if deferred).
+
+2. **B2 Inbox path resolution** — new §7.1a "Inbox Path Resolution" with `HFT_OPS_LEDGER_INBOX` env var + `--ledger-inbox` CLI arg + fail-fast when orchestrated / warn-skip when standalone. Producers cloned into standalone repos (BQP, future OPRA) need uniform path discovery regardless of their working directory.
+
+3. **B3 Phase 3.5 gate widening** — §13.3 updated to require `hft-ops sweep fingerprints --verify` clean at every Phase 11 producer-rollout milestone, not just Batch 1. Mid-Phase-11 Phase 3.5 migrations (Batches 2-4) could drift fingerprint inputs otherwise.
+
+4. **B4 Pydantic-canonical byte-compare** — §7.3 idempotent check now compares `canonical_json_dumps(validated.model_dump())` on BOTH sides, not raw inbox bytes. Raw inbox may have non-canonical whitespace/key-order; Pydantic roundtrip canonicalizes. The `records/` file is the CANONICAL form, never the raw inbox form.
+
+5. **B5 Runtime-generated INSERT** — §7.3.1 now specifies INSERTs are built at runtime from Pydantic field list (positional `?` matches field order); meta-test `test_insert_statement_column_count_matches_schema` guards against column drift across DDL changes.
+
+6. **B6 Schema migration protocol** — new §5.7 "Schema Migration Protocol" with numbered `migrations/NNN_*.sql` files + `hft-ops ledger migrate-schema` CLI + rollback on mid-migration failure. Replaces the implicit `CREATE TABLE` approach which would fail on any v1.0 → v1.1 version bump with existing ledger on disk.
+
+7. **B7 Week 1 bootstrap order** — new §15.1a "Phase 11 Week 1 Bootstrap Order" with strict Day 1-5 sequencing to resolve the chicken-and-egg between Pydantic codegen, JSON Schema, and test fixtures. Day 1 TOML freeze; Day 2 Python codegen; Day 3 hand-crafted golden envelope; Day 4 fixture parameterization; Day 5 Rust skeleton + parity test (end-of-W1 gate).
+
+8. **B8 `UpstreamNotYetIngestedError` vs quarantine** — §14.8 refactored to distinguish two failure modes: soft `UpstreamNotYetIngestedError` (routes to `pending/`, retried) vs hard `NormalizationStatsMismatchError` (immediate quarantine). Prior v1.2 collapsed both into `IntegrityError` → all quarantine → false alarms during sweeps with legitimate ordering races.
+
+**4 decision amendments:**
+
+- **D1 Timeline honest** — §15.1 rescoped from "4 weeks" (Round 10 bump) to "8-10 weeks with weekly go/no-go gates." Agent P1 mid-estimate for Python-producers-only scope is ~355 focused hours ≈ 8-9 weeks at 40h/wk. State the range honestly to avoid schedule pressure cutting Tier-1 invariants. Rust producer wiring (BQP, MBO) explicitly deferred to Phase 11.5; Rust parity validation (crate skeleton + golden test) stays IN Phase 11 Week 1 to de-risk the biggest unknown.
+
+- **D2 Rust crate simplified layout** — §2.5.1 codified: single-package Rust crate at repo root (`[package]` + `[lib] path = "rust/lib.rs"`), matching `hft-statistics` precedent (verified by reading `hft-statistics/Cargo.toml`). NO Cargo workspace. BOTH `SCHEMA_HASH` (TOML-side drift) AND golden serialization test (Rust-side struct drift) required — each catches a different failure direction; one alone is insufficient.
+
+- **D3 `metadata_json` IN content hash** — §3.5 flipped: `content_hash = sha256(canonical_json_dumps(envelope))` covers FULL envelope including `metadata_json`. Prevents silent producer-race data loss (previously, two envelopes differing only in metadata_json shared the same filename and `os.replace` overwrote the first). Identity semantics unchanged (PK remains `experiment_fingerprint`); `content_hash` only governs inbox filenames.
+
+- **D4 `pending/` retry on every ingest call** — §7.3 `ingest_all` now scans `pending/` BEFORE `inbox/` on every invocation (option α, no background daemon). Age-out to quarantine at 24h. Orchestrator-between-stages-ingest for deterministic ordering is Phase 12, NOT Phase 11 — Phase 11 relies solely on `pending/` for out-of-order handling.
+
+**Scope descope for Phase 11 (D1)**:
+- Python producers only: trainer (H21) + backtester (H22). Both required to exercise §14.8 end-to-end.
+- Rust crate skeleton + parity tests: IN scope (de-risks biggest unknown).
+- Rust producer wiring (H23 BQP, H24 MBO, evaluator): DEFERRED to Phase 11.5 (≈ 2 weeks additional).
+- Tier-2 B1 promoted to W1; B8, C-FF6, C-FF7, C-SC8 stay in Phase 11.5.
+
+**New tests added to §18.2**:
+- Cross-language parity tests (8)
+- Normalization integrity tests (4)
+- Pending retry tests (3)
+- Inbox resolution tests (4)
+- Schema migration tests (4)
+- Schema parity test (1)
+- Total new: ~24 tests on top of the prior §18.2 categories.
+
+**§18.3 failure-mode-to-test-name mapping** — explicit `test_fm_01_*` through `test_fm_10_*` names for every §12.1 failure mode + meta-test enforcing coverage.
+
+**Validation evidence** (embedded for Phase 11 implementation):
+- §5.3 DDL re-parses cleanly post-amendments.
+- §4.2 + §4.5 TOML re-parse cleanly.
+- §3.2 envelope JSON Schema adds `pattern` on 4 timestamp fields; Draft-07 parser accepts.
+- `pipeline_contract_version` pattern still rejects legacy `off_exchange_1.0`.
+- All 5 producer envelope examples still parse.
+- Legacy `ExperimentRecord` field mapping (§13.1b) still enumerates 25 fields.
 
 ### Round 11 Tier-1 Amendments (v1.1 → v1.2)
 
