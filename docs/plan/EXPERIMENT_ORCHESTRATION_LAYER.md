@@ -68,18 +68,18 @@ A **SQLite + Parquet hybrid ledger** (Ledger v2) with a **contract-first Experim
 **Ledger**:
 - `hft-ops/ledger/index.json` (single file) + `hft-ops/ledger/records/*.json` (34 files).
 - All 34 entries are retroactive (`_retro` suffix). Zero production pipeline records.
-- Schema: `ExperimentRecord` dataclass at `hft-ops/src/hft_ops/ledger/experiment_record.py:57-134` with 20 fields.
+- Schema: `ExperimentRecord` dataclass at `hft-ops/src/hft_ops/ledger/experiment_record.py:56-134` with **25 dataclass fields** (verified via `grep -c '^    [a-z_]*:' experiment_record.py`): `experiment_id, name, manifest_path, fingerprint, provenance, contract_version, extraction_config, training_config, backtest_params, training_metrics, backtest_metrics, dataset_health, tags, hypothesis, description, notes, created_at, duration_seconds, status, stages_completed, sweep_id, axis_values, record_type, sub_records, parent_experiment_id`. `provenance` is a nested `Provenance` dataclass (`hft-ops/src/hft_ops/provenance/lineage.py:195-245`) with fields `{git: GitInfo, config_hashes: dict, data_dir_hash, contract_version, timestamp_utc, retroactive, schema_version}`.
 
 **Fingerprinting**:
-- Phase 3 shipped §3.3b: `compute_fingerprint()` in `hft-ops/src/hft_ops/ledger/dedup.py:174-281` now resolves `_base:` inheritance before hashing via `resolve_inheritance()` at `dedup.py:65-109` (runtime-lazy import of `lobtrainer.config.merge`).
-- Algorithm: `sha256(json.dumps({extraction, training, backtest, data_manifest, contract_version}, sort_keys=True, default=str))`.
-- Excludes: `{name, description, tags, version, output_dir, log_level, verbose, experiment}` and entire `stages.validation` section (validation is observation, not treatment — `dedup.py:253-257`).
+- Phase 3 shipped §3.3b: `compute_fingerprint()` in `hft-ops/src/hft_ops/ledger/dedup.py:284-391` now resolves `_base:` inheritance before hashing via `resolve_inheritance()` at `lob-model-trainer/src/lobtrainer/config/merge.py:85-182` (loaded lazily by `_load_trainer_config_resolved()` at `dedup.py:117-195`, which walks `_base:` chains and applies `deep_merge()` before serialization).
+- Algorithm: `sha256(json.dumps({extraction, training, backtest, data_manifest, contract_version}, sort_keys=True, default=str))` (verified at `dedup.py:390`).
+- Excludes: `{name, description, tags, version, output_dir, log_level, verbose, experiment}` and entire `stages.validation` section (validation is observation, not treatment — see `_extract_fingerprint_fields()` at `dedup.py:255-282` for exclusion-set embedding + `dedup.py:364-368` for validation-stage-excluded comment).
 
 **Config Composition** (Phase 3 Batch 1 in progress):
 - `lob-model-trainer/src/lobtrainer/config/merge.py` (v2, hand-rolled, ~205 LOC) replaces `OmegaConf` (explicitly rejected after adversarial review).
 - Supports `_base: str | list[str]`, left-to-right merge, child overrides.
 - `_partial: true` sentinel for intermediate bases.
-- 4 of 17 orthogonal bases created: `models/tlob_compact_regression.yaml`, `datasets/nvda_e5_60s.yaml`, `labels/regression_huber.yaml`, `train/regression_default.yaml`.
+- **21 base files created across 4 categories** (Phase 3.5 progressive migration in-flight, initial 4-base commit has grown): `datasets/` (8 bases including `nvda_e5_60s.yaml`), `labels/` (4 bases including `regression_huber.yaml`), `models/` (5 bases including `tlob_compact_regression.yaml`), `train/` (4 bases including `regression_default.yaml`). Memory ledger confirms Phase 3.5 ongoing; 36 legacy configs migrate across 4 batches.
 - 36 configs to migrate across 4 batches (progressive — not blocking).
 
 **Producers** (5 primary, 1 future):
@@ -151,7 +151,7 @@ The following principles are **load-bearing** and MUST be preserved in all imple
 
 **Rationale**: Same config re-run must produce the same identity (enables dedup, reproducibility, skip-if-exists). Different configs must produce different identities. No UUIDs, no auto-increment integers, no random IDs.
 
-**Implementation**: `experiment_fingerprint` = Phase 3's existing hash (`dedup.py:174-281`). Phase 10 REUSES it. Does not introduce a competing hash.
+**Implementation**: `experiment_fingerprint` = Phase 3's existing hash (`dedup.py:284-391`). Phase 10 REUSES it. Does not introduce a competing hash.
 
 **Anti-pattern rejected**: MLflow/W&B auto-generated run IDs. Sacred's source-code hashing (whitespace-sensitive).
 
@@ -185,7 +185,7 @@ The following principles are **load-bearing** and MUST be preserved in all imple
 **Rationale**: Prevents import-chain fragility; runners evolve independently; language-agnostic (Rust producers work the same as Python).
 
 **Implementation**: Preserved from current state (`hft-ops/CODEBASE.md §1 invariant #1`). Two soft exceptions ALLOWED:
-- `lobtrainer.config.merge.resolve_inheritance` — lazy import, optional, fallback to raw YAML if missing (`dedup.py:94-100`).
+- `lobtrainer.config.merge.resolve_inheritance` (merge.py:85-182) — lazy import via `_load_trainer_merge_module()` at `dedup.py:73-114`; optional; fallback to raw YAML if missing (see the `return None` path at `dedup.py:95-99` + call-site at `dedup.py:190-194`).
 - `hft_evaluator.fast_gate.run_fast_gate` — library import, explicit Phase 2b decision (`stages/validation.py:1-32`).
 
 No new soft exceptions without updating this principle.
@@ -298,7 +298,8 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
     },
     "pipeline_contract_version": {
       "type": "string",
-      "description": "The `pipeline_contract.toml` contract edition at producer runtime (e.g., '2.2' or 'off_exchange_1.0')."
+      "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
+      "description": "The top-level `[contract].schema_version` from `contracts/pipeline_contract.toml` at producer runtime. Example values: '2.2', '2.3', '3.0'. This is the PIPELINE-WIDE contract version, not a feature-schema-specific version (those live in `feature_schema_ref`)."
     },
     "producer": {
       "type": "string",
@@ -312,9 +313,10 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
         "MBO-LOB-reconstructor",
         "mbo-statistical-profiler",
         "opra-statistical-profiler",
-        "opra-feature-extractor"
+        "opra-feature-extractor",
+        "legacy-migrator"
       ],
-      "description": "Enum extensible; new producers require schema version bump."
+      "description": "Enum extensible; new producers require schema version bump. Special value 'legacy-migrator' is used by §13.1 Step 2 to backfill the 34 pre-Phase-10 retroactive records; envelopes with this producer are exempted from the §14.8 and §14.9 integrity gates (§13.1b legacy-migrator exemption)."
     },
     "producer_version": {
       "type": "string",
@@ -578,12 +580,15 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
       "type": ["object", "null"],
       "description": "Only for record_type='export'. Populated by BQP/MBO extractor producers.",
       "properties": {
-        "days_processed": {"type": "integer"},
-        "total_sequences": {"type": "integer"},
-        "sequence_length": {"type": "integer"},
-        "stride": {"type": "integer"},
-        "bin_size_seconds": {"type": ["integer", "null"]},
-        "normalization": {"type": "string"},
+        "days_processed": {"type": "integer", "minimum": 0},
+        "total_sequences": {"type": "integer", "minimum": 0},
+        "sequence_length": {"type": "integer", "minimum": 1, "description": "T in [N,T,F] sequence shape."},
+        "stride": {"type": "integer", "minimum": 1},
+        "bin_size_seconds": {"type": ["integer", "null"], "minimum": 1},
+        "normalization": {"type": "string", "description": "Rust-side strategy: 'none' (default per T15), 'market_structure_zscore' (deprecated), 'per_day_zscore' (deprecated)."},
+        "n_features": {"type": "integer", "minimum": 1, "description": "F in [N,T,F] sequence shape. MUST be ≤ the total_count declared in the referenced feature_schema_ref registry entry of pipeline_contract.toml. Cross-field invariant (§7.6.4)."},
+        "feature_layout": {"type": "string", "enum": ["grouped", "lobster"], "description": "How features are arranged in the last axis. 'grouped' = [ask_prices(10), ask_sizes(10), bid_prices(10), bid_sizes(10), derived...]; 'lobster' = interleaved [ask_p_L1, ask_s_L1, bid_p_L1, bid_s_L1, ...]. Contract-registered via pipeline_contract.toml [features.layout]."},
+        "feature_indices_subset": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0}, "uniqueItems": true, "description": "If this export uses a strict SUBSET of the registered feature_schema_ref (e.g., MBO stable-98 instead of full-148), the sorted list of active feature indices. NULL = all features in schema used."},
         "splits": {
           "type": "object",
           "properties": {
@@ -604,7 +609,22 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
         "num_train_samples": {"type": "integer"},
         "num_val_samples": {"type": "integer"},
         "num_test_samples": {"type": "integer"},
-        "training_time_seconds": {"type": "number"}
+        "training_time_seconds": {"type": "number"},
+        "normalization_method": {
+          "type": ["string", "null"],
+          "enum": ["none", "hybrid", "global_zscore", "per_feature_minmax", "market_structure_zscore", null],
+          "description": "Python-side normalization method applied by the trainer. 'none' means raw f64 features were consumed; 'hybrid'/'global_zscore'/'per_feature_minmax' are the three production strategies in lob-model-trainer data/normalization.py. Legacy 'market_structure_zscore' is Rust-side, kept for pre-T15 records. See root CLAUDE.md §T15."
+        },
+        "normalization_stats_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 of the canonical JSON representation of the fitted normalization statistics (means, stds or mins/maxes, per feature). NULL iff normalization_method == 'none'. Critical invariant: backtester's signal_provenance.normalization_stats_sha256 MUST equal this value (§14.8 / §7.6.1 rule 10). Guards against silent train/inference divergence under T15 'Raw Rust, Variable Python'."
+        },
+        "normalization_source_split": {
+          "type": ["string", "null"],
+          "enum": ["train", "all", "cv_folds", null],
+          "description": "Which split the normalization stats were computed FROM. Default 'train' (no leakage from val/test). 'all' is a known-leakage mode (research-only); 'cv_folds' means per-fold refit under CVTrainer (§T11)."
+        }
       }
     },
     "strategy_info": {
@@ -621,7 +641,34 @@ Every producer writes a canonical JSON envelope to `hft-ops/ledger/inbox/{conten
     },
     "signal_provenance": {
       "type": ["object", "null"],
-      "description": "Only for record_type='backtest'. Mirrors signal_metadata."
+      "description": "Only for record_type='backtest'. Mirrors the signal_metadata.json emitted by the trainer (see CLAUDE.md Trainer → Backtester signal export). Purpose: lets the ingester verify that the backtester loaded the same signal the trainer produced, under the same normalization.",
+      "properties": {
+        "trainer_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "The experiment_fingerprint of the upstream trainer run. MUST equal exactly ONE of upstream_experiment_ids (resolved via fingerprint_history table). §7.6.1 rule 4 + §BQ7 upstream integrity."
+        },
+        "normalization_method": {
+          "type": ["string", "null"],
+          "enum": ["none", "hybrid", "global_zscore", "per_feature_minmax", "market_structure_zscore", null],
+          "description": "Must equal the trainer's training_info.normalization_method."
+        },
+        "normalization_stats_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "MUST equal the trainer's training_info.normalization_stats_sha256. Ingest REJECTS on mismatch (§14.8). This is the single most critical cross-stage integrity gate: a silent normalization-stats drift between training and inference produces numerically-plausible but semantically-wrong signals."
+        },
+        "signal_file_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "SHA-256 of the predicted_returns.npy (regression) or predictions.npy (classification) file the backtester consumed."
+        },
+        "signal_split": {
+          "type": ["string", "null"],
+          "enum": ["train", "val", "test", "full", null],
+          "description": "Which split the signal was generated on. Backtests typically use 'test'; 'train' backtests are diagnostics."
+        }
+      }
     },
     "sub_records": {
       "type": "array",
@@ -673,7 +720,7 @@ Four concrete examples based on real producer outputs (Round 9 V1 agent's stress
 {
   "envelope_version": 1,
   "envelope_schema_version": "1.0.0",
-  "pipeline_contract_version": "off_exchange_1.0",
+  "pipeline_contract_version": "2.2",
   "producer": "basic-quote-processor",
   "producer_version": "0.1.0",
   "record_type": "export",
@@ -722,6 +769,9 @@ Four concrete examples based on real producer outputs (Round 9 V1 agent's stress
     "stride": 1,
     "bin_size_seconds": 60,
     "normalization": "none",
+    "n_features": 34,
+    "feature_layout": "grouped",
+    "feature_indices_subset": null,
     "splits": {
       "train": {"n_days": 163, "n_sequences": 50201, "date_range": ["2025-02-03", "2025-09-30"], "failed_days": []},
       "val": {"n_days": 35, "n_sequences": 10780, "date_range": ["2025-10-01", "2025-11-13"], "failed_days": []},
@@ -1097,6 +1147,7 @@ MBO extractor is the second-most-complex producer (148-feature schema, 9-crate w
     "normalization": "none",
     "n_features": 98,
     "feature_layout": "grouped",
+    "feature_indices_subset": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97],
     "splits": {
       "train": {"n_days": 163, "n_sequences": 162999, "date_range": ["2025-02-03", "2025-09-30"], "failed_days": []},
       "val":   {"n_days":  35, "n_sequences":  52885, "date_range": ["2025-10-01", "2025-11-13"], "failed_days": []},
@@ -1945,7 +1996,7 @@ Rebuild does NOT regenerate Parquet files. If Parquet is missing, `artifacts`/`b
 
 ### §6.1 Authoritative Fingerprint Source
 
-Phase 3's `compute_fingerprint()` (`hft-ops/src/hft_ops/ledger/dedup.py:174-281`) is the ONLY fingerprint authority. Phase 10 REUSES it verbatim.
+Phase 3's `compute_fingerprint()` (`hft-ops/src/hft_ops/ledger/dedup.py:284-391`) is the ONLY fingerprint authority. Phase 10 REUSES it verbatim.
 
 Algorithm:
 
@@ -2029,6 +2080,30 @@ FROM experiments
 WHERE symbol = ? OR symbols_json LIKE '%"' || ? || '"%';
 ```
 
+### §6.4a Fingerprint Composition per record_type (Round 11 Agent B BQ7)
+
+Phase 3's `compute_fingerprint()` already composes the fingerprint from `{extraction, training, backtest, data_manifest, contract_version}` for a fully-populated manifest. However, single-stage producers (backtest-only, evaluator-only) often have SPARSE manifests — the backtest stage is populated but `extraction` and `training` are empty. Without upstream integration, two backtests with identical `backtest_params` but DIFFERENT upstream trainers would produce the SAME fingerprint → a collision.
+
+**Rule**: every producer MUST include the `sorted(upstream_fingerprints)` list as an explicit component of its fingerprint input when the producer consumes one or more ledger-resident upstream experiments.
+
+**Authoritative component set per record_type** (amends `compute_fingerprint` behavior in dedup.py; enforced on emit, verified on ingest):
+
+| record_type | Required components | Optional components |
+|---|---|---|
+| `export` | `extraction`, `data_manifest`, `contract_version` | `training` if extractor config declares downstream-affecting knobs |
+| `training` | `training`, `data_manifest`, `contract_version`, `upstream_fingerprints` (exports) | `extraction` if inlined |
+| `backtest` | `backtest`, `contract_version`, `upstream_fingerprints` (trainers) | — |
+| `evaluation` | `evaluation`, `data_manifest`, `contract_version`, `upstream_fingerprints` (exports) | — |
+| `analysis` | `analysis`, `data_manifest`, `contract_version`, `upstream_fingerprints` (if any) | — |
+| `calibration` | `calibration`, `contract_version`, `upstream_fingerprints` (parent training) | — |
+| `sweep_aggregate` | `sweep_id`, `contract_version`, `upstream_fingerprints` (each grid point) | — |
+
+Where `upstream_fingerprints = sorted(set(resolve_upstream_ref(d).experiment_fingerprint for d in upstream_artifact_dirs))` — dedup + sort ensures determinism.
+
+**dedup.py change**: `compute_fingerprint` accepts an optional `upstream_fingerprints: list[str]` kwarg; when present, it's serialized into `components["upstream_fingerprints"]`. Phase 10 Step 3 of §13.1 migration sets this kwarg on all producer call sites. Existing 34 records are grandfathered (fingerprint preserved verbatim; `upstream_fingerprints` NOT added retroactively).
+
+**Test** (§18.2): two backtests with identical `backtest_params` but different upstream trainers produce DIFFERENT fingerprints. Two backtests with identical params AND identical upstream trainers produce the SAME fingerprint (dedup works correctly).
+
 ### §6.5 Fingerprint Version Bumping Protocol
 
 If the algorithm must change (e.g., canonicalization fix, exclusion-set revision):
@@ -2069,10 +2144,11 @@ A producer MUST:
 
 1. Compute `experiment_fingerprint` at emit time (via Phase 3 algorithm).
 2. Construct a valid envelope conforming to `hft_contracts.orchestration.Envelope` Pydantic model.
-3. Compute envelope `content_hash = sha256(envelope_json_without_metadata_json)`.
-4. Write envelope atomically: `open(f"{content_hash}.json.tmp")` → write + fsync → `os.replace("{content_hash}.json")`.
-5. Place in `hft-ops/ledger/inbox/`.
-6. Emit Parquet side files (if any) with content-addressable names to `hft-ops/ledger/metrics/{yyyy_mm}/{parquet_hash}.parquet`.
+3. Compute envelope `content_hash = sha256(envelope_json_without_metadata_json)` (uses canonical JSON per §3.3.6).
+4. Write Parquet side files FIRST (if any) — content-addressable names to `hft-ops/ledger/metrics/{yyyy_mm}/{parquet_hash}.parquet`, with `fsync` after close. Parquet MUST be flushed before the envelope is placed in inbox. See §7.4.1 for the rollback matrix when this ordering is violated.
+5. Write envelope atomically: `open(f"{content_hash}.json.tmp")` → write + fsync → `os.replace("{content_hash}.json")`.
+6. Place envelope file in `hft-ops/ledger/inbox/`.
+7. For `record_type='backtest'` and `record_type='training'` that consumes an upstream export/training: resolve every upstream producer's `experiment_fingerprint` via the §7.1.1 API and populate `signal_provenance.trainer_fingerprint` / `upstream_experiment_ids` / `lineage[].source_hash` accordingly — NEVER leave these as free-form strings when the upstream is ledger-resident.
 
 A producer SHOULD:
 - Log envelope write to stderr with `content_hash` for debugging.
@@ -2084,6 +2160,90 @@ A producer MUST NOT:
 - Write directly to `records/*.json`.
 - Delete or modify another producer's envelope.
 - Block on ingest completion (ingest is async from producer's perspective).
+
+### §7.1.1 Upstream Fingerprint Resolution API (Round 11 Agent B BQ7)
+
+**Problem**: a backtester at emit time knows the path to its signal directory (e.g., `lob-model-trainer/outputs/TLOB_E5_20260313T061500_...`) but NOT the `experiment_fingerprint` of the trainer that produced that signal. Without a programmatic way to look up the upstream fingerprint, lineage claims in the envelope degenerate into free-form strings (`source_name` only), and `§14.9` upstream integrity cannot be enforced.
+
+**Solution**: every producer drops a small `.envelope-ref` breadcrumb file alongside its primary artifact directory. Consumers read this file to resolve upstream fingerprints.
+
+**Breadcrumb file format** (`{artifact_dir}/.envelope-ref`):
+
+```json
+{
+  "experiment_fingerprint": "a3b8f1c4d5e6...64hex...",
+  "experiment_id": "TLOB_Regression_E5_20260313T061500_a3b8f1c4",
+  "producer": "lob-model-trainer",
+  "producer_version": "2.1.0",
+  "record_type": "training",
+  "envelope_content_hash": "b8c2d3e4...64hex...",
+  "inbox_path": "hft-ops/ledger/inbox/b8c2d3e4...json",
+  "emitted_at": "2026-03-13T06:15:00Z"
+}
+```
+
+Written **before** the envelope reaches the inbox (step 5 of §7.1), so consumers invoked by the same orchestration run can find it immediately. Atomically via tmp+rename.
+
+**Consumer API** (Python — `hft_contracts/orchestration/upstream.py`):
+
+```python
+from pathlib import Path
+import json
+from typing import NamedTuple, Optional
+
+class UpstreamRef(NamedTuple):
+    experiment_fingerprint: str
+    experiment_id: str
+    producer: str
+    producer_version: str
+    record_type: str
+    envelope_content_hash: str
+    inbox_path: str
+    emitted_at: str
+
+class UpstreamResolutionError(LookupError):
+    """Raised when an upstream artifact directory has no .envelope-ref breadcrumb AND is not listed as a lineage source_kind in {"raw_data", "reconstructor"}."""
+
+def resolve_upstream_ref(artifact_dir: Path) -> UpstreamRef:
+    """Read the upstream producer's .envelope-ref breadcrumb.
+
+    Raises UpstreamResolutionError if the breadcrumb is missing; callers MUST
+    either (a) handle the error and set source_kind="raw_data" / "reconstructor"
+    (free-form source_name permitted), or (b) fail-fast because the upstream
+    is expected to be ledger-resident.
+    """
+    ref_path = artifact_dir / ".envelope-ref"
+    if not ref_path.exists():
+        raise UpstreamResolutionError(
+            f"no .envelope-ref at {artifact_dir}. If this is ledger-resident "
+            f"upstream, the producer failed to emit the breadcrumb. If this is "
+            f"raw data or reconstructor output, use source_kind='raw_data' or "
+            f"'reconstructor' and free-form source_name instead."
+        )
+    data = json.loads(ref_path.read_text())
+    return UpstreamRef(**data)
+```
+
+**Rust equivalent** (`hft_contracts_rs::orchestration::upstream::resolve_upstream_ref`) — same semantics, `serde_json` for parse, custom error type.
+
+**When a producer writes this breadcrumb** (mandatory):
+- BQP, MBO extractor at the root of the export directory (`data/exports/{name}/.envelope-ref`).
+- Trainer at the root of the output directory (`lob-model-trainer/outputs/{exp_id}/.envelope-ref`).
+- Backtester at the root of the metrics directory (`lob-backtester/outputs/{exp_id}/.envelope-ref`).
+- Evaluator at the root of the report directory.
+
+**When a consumer reads it**:
+- Trainer loading an export → reads `{export_dir}/.envelope-ref` → populates `lineage[]` with `source_hash = upstream_ref.experiment_fingerprint`, `source_kind = "export"`.
+- Backtester loading a signal → reads `{signal_dir}/.envelope-ref` → populates `signal_provenance.trainer_fingerprint` + `upstream_experiment_ids = [upstream_ref.experiment_id]`.
+- Evaluator loading exports → same pattern.
+
+**Invariant**: if `lineage[].source_kind ∈ {"export", "trainer_run", "backtest_run", "evaluator_run"}` then `lineage[].source_hash` MUST be a 64-char hex (resolves to `experiments.experiment_fingerprint` OR `fingerprint_history.fingerprint_value`). Enforced by §14.9.
+
+**Test** (§18.2 Upstream-resolution tests, 4 new):
+- Producer emits breadcrumb → consumer reads → round-trip equality on experiment_fingerprint.
+- Breadcrumb missing → `UpstreamResolutionError` raised, consumer falls back to free-form source_name.
+- Breadcrumb present but malformed → `UpstreamResolutionError`.
+- Producer writes breadcrumb atomically (power-cut mid-write → consumer sees either the old breadcrumb or no breadcrumb, never a corrupted one).
 
 ### §7.2 Ingest CLI
 
@@ -2359,12 +2519,39 @@ Every envelope passes through:
 1. **JSON parse** — syntactically valid JSON?
 2. **Schema validation** — conforms to envelope-v1 JSON Schema?
 3. **Enum validation** — all enum fields have valid values?
-4. **Cross-field validation** — e.g., `n_horizons == len(horizons)`; `record_type='export'` requires `export_stats` non-null; `record_type='training'` requires `model_type` non-null.
+4. **Cross-field validation** — enumerated in §7.6.1 below (hard-fail set) and §7.6.2 (warn set).
 5. **Fingerprint plausibility** — 64-char lowercase hex?
 6. **Artifact/Parquet path existence** — warn (not fail) if referenced file is missing (allows producer-writes-envelope-first race to resolve; ingest may be delayed).
 7. **Foreign key plausibility** — if `upstream_experiment_ids` non-empty, referenced IDs SHOULD exist in experiments table (warn if not — may be out-of-order ingest).
 
-Failures at 1-5: quarantine + `.error` sidecar. Failures at 6-7: log warning but proceed.
+Failures at 1-3 and the hard-fail subset of 4 (§7.6.1) → quarantine + `.error` sidecar. Failures at 5 → quarantine. Failures at 6-7 and the warn subset of 4 (§7.6.2) → log warning and proceed.
+
+#### §7.6.1 Hard-fail cross-field validations
+
+Each rule is a single-line predicate on the validated envelope object (`e`). If false → quarantine.
+
+1. `e.n_horizons == len(e.horizons)` — label-dimension consistency.
+2. `e.record_type == "export"` ⇒ `e.export_stats is not None`.
+3. `e.record_type == "training"` ⇒ `e.model_type is not None` AND `e.training_info is not None`.
+4. `e.record_type == "backtest"` ⇒ `e.strategy_info is not None` AND `len(e.upstream_experiment_ids) >= 1`.
+5. `e.record_type == "evaluation"` ⇒ `e.feature_eval_info is not None`.
+6. `e.record_type == "sweep_aggregate"` ⇒ `e.sweep_id is not None`.
+7. `e.export_stats.n_features <= feature_schema_registry[e.feature_schema_ref].total_count` — subset check; producer cannot claim more features than the registered schema declares.
+8. If `e.export_stats.feature_indices_subset is not None`: `len(e.export_stats.feature_indices_subset) == e.export_stats.n_features` AND `all(0 <= i < total_count for i in feature_indices_subset)`.
+9. `e.symbols_json is None` XOR `e.symbol in json.loads(e.symbols_json)` — primary symbol consistency for multi-symbol runs.
+10. `e.training_info.normalization_stats_sha256 is not None` ⇔ `e.training_info.normalization_method in ("hybrid","global_zscore","per_feature_minmax")` — stats-hash required when a non-trivial normalization is declared (§BQ3 / §T2).
+11. `e.sub_records == []` unless `e.record_type == "sweep_aggregate"` — non-aggregate envelopes cannot carry sub-records.
+
+#### §7.6.2 Warn-only cross-field validations
+
+Violation logs a structured warning but ingest proceeds:
+
+1. `metric.name not in MetricKey registry` — unregistered metric key (§4.3 permits; warn to encourage registration).
+2. `gate.name not in GateKey registry` — same.
+3. `bulk_parquet[].path` does not exist on disk — see §7.3 / §7.4.1 state A/B/C.
+4. `upstream_experiment_ids` contains IDs not yet present in `experiments` table — out-of-order ingest; retry-later.
+5. Range violation (metric `value` outside declared `range` / `lower_bound` / `upper_bound`) — value is preserved; downstream consumers may flag.
+6. `e.git.commit_hash == ""` (empty) on a non-retroactive envelope — git not on PATH or producer not launched from a repo; ingest proceeds because `not_git_tracked` sentinel is the documented escape hatch (§3.2 `source_commit` pattern).
 
 ---
 
@@ -2991,60 +3178,98 @@ hft-ops ledger regenerate-parquet --from-outputs lob-model-trainer/outputs/
 
 ### §13.1b Legacy `ExperimentRecord` → envelope-v0 Field Mapping
 
-The 34 retroactive records live as `ExperimentRecord` dataclass instances at `hft-ops/src/hft_ops/ledger/experiment_record.py:57-134`. Step 2 of §13.1 transforms each into a v0-permissive envelope before ingesting via the standard pipeline. Mapping is 1:1 where possible; v0-specific accommodations are marked with ★.
+**Round 11 rewrite**: the previous table referenced 18 field names that DO NOT exist on the `ExperimentRecord` dataclass AND omitted 9 fields that DO exist. This version enumerates the actual 25 dataclass fields at `experiment_record.py:88-132` plus the 7 nested fields of `Provenance` at `lineage.py:195-245`. Ground truth verified by direct grep at Round 11 time.
 
-| Legacy `ExperimentRecord` field | Envelope v0 target | Notes |
+#### Actual `ExperimentRecord` fields (25 dataclass fields; `experiment_record.py:88-132`)
+
+| # | Legacy field (type) | → envelope-v1 target | Transformation |
+|---|---|---|---|
+| 1 | `experiment_id: str` | `.experiment_id` | Direct copy. |
+| 2 | `name: str` | `.metadata_json.legacy_name` AND prepended to `.description` | Legacy "name" is a free-form label (e.g., "HMHP_128feat_XNAS_v2"); v1 envelope has no `name` field. Preserve verbatim for traceability. |
+| 3 | `manifest_path: str` | `.metadata_json.legacy_manifest_path` | Historical YAML manifest absolute path; not a v1 concept. Preserved. |
+| 4 | `fingerprint: str` | `.experiment_fingerprint` | Direct copy; `fingerprint_version = 1`. Byte-identical preservation is the §13.1 success criterion #2. |
+| 5 | `provenance: Provenance` | `.git` + `.lineage[]` + `.metadata_json.legacy_provenance_schema_version` | Decomposed per §13.1b-Provenance below. |
+| 6 | `contract_version: str` | `.pipeline_contract_version` | Direct copy; default `"2.2"` if empty. |
+| 7 | `extraction_config: Dict[str, Any]` | `.config_source` (serialized JSON) + `.config_format="json"` | If `.config_source` would exceed 8 KB, redirect to `.artifacts[]` with `kind="config"`, `path="archive/legacy/{exp_id}/extraction_config.json"`, and set `.config_source = null`. ★ |
+| 8 | `training_config: Dict[str, Any]` | `.artifacts[]` with `kind="training_config"` + key subset duplicated into `.model_type`, `.model_family`, `.task`, `.sampling_strategy`, `.sampling_config`, `.label_family`, `.label_spec`, `.primary_horizon`, `.n_horizons`, `.horizons` | Parse trainer YAML-equivalent dict; extract typed fields. `training_config.model.model_type` → `.model_type`; `training_config.data.labeling_strategy` → `.label_family`; etc. Full dict preserved as artifact. ★ |
+| 9 | `backtest_params: Dict[str, Any]` | `.artifacts[]` with `kind="backtest_params"` + subset into `.strategy_info` | Typed fields extracted into `.strategy_info`; full dict preserved. ★ |
+| 10 | `training_metrics: Dict[str, Any]` | `.metrics[]` long-format rows | One row per key: `{family: <inferred>, name: key.upper(), split: <inferred or "full">, horizon: <inferred or null>, epoch: "final", value: v}`. Family inferred by regex: `^ic` / `^pearson` / `^r2` → `regression`; `^sharpe` / `^total_return` / `^drawdown` / `^win` → `backtest_pnl`; `^acc` / `^f1` / `^precision` / `^recall` → `classification`; else `custom`. ★ |
+| 11 | `backtest_metrics: Dict[str, Any]` | `.metrics[]` with `family="backtest_pnl"` (default) | Same flattening as training_metrics. Keys with `^option_` prefix get `family="option_metrics"`. |
+| 12 | `dataset_health: Dict[str, Any]` | `.metrics[]` with `family="dataset_health"` | Same flattening. |
+| 13 | `tags: List[str]` | `.tags[]` | Direct copy (each string becomes one row in `tags` table via §5.3). |
+| 14 | `hypothesis: str` | `.hypothesis` | Direct copy. Empty string allowed for retroactive (§3.2 says "mandatory per hft-rules §13 but accepts empty for retroactive"). |
+| 15 | `description: str` | `.description` | Direct copy. Concatenated with `name` for readability: `f"[{name}] {description}"`. |
+| 16 | `notes: str` | `.notes` (top-level) | Direct copy. Additionally, if `len(notes) > 64`, insert one row into `notes` table via post-ingest pass `extract_legacy_notes()`; author="legacy-migrator"; created_at=legacy `created_at`. |
+| 17 | `created_at: str` | `.created_at` | Direct copy (legacy uses `datetime.now(timezone.utc).isoformat()` → UTC with offset suffix; migration rewrites `+00:00` to `Z` for §14.8 consistency). |
+| 18 | `duration_seconds: float` | `.wall_clock_ms` | `int(round(duration_seconds * 1000))`. |
+| 19 | `status: str` | `.status` | Direct copy. Legacy values `{pending, completed, failed, partial}` all match v1 enum; any other value → quarantine. |
+| 20 | `stages_completed: List[str]` | `.metadata_json.legacy_stages_completed` | Free-form list of stage names; v1 records stage completion via per-stage envelopes instead. Preserved. |
+| 21 | `sweep_id: str` | `.sweep_id` | Direct copy. Empty → NULL. |
+| 22 | `axis_values: Dict[str, str]` | `.axis_values` (JSON-serialized) | Direct copy. Empty dict → NULL. |
+| 23 | `record_type: str` | `.record_type` | Direct copy; all 6 legacy values match v1 CHECK constraint (§5.3). |
+| 24 | `sub_records: List[Dict[str, Any]]` | `.sub_records` | Direct copy (each entry is a sweep-child summary dict). Empty for non-aggregate types. |
+| 25 | `parent_experiment_id: str` | `.parent_id` | Direct copy. Empty → NULL. |
+
+#### `Provenance` sub-structure (`lineage.py:195-245`; decomposed on migration)
+
+| Nested field | → envelope-v1 target | Transformation |
 |---|---|---|
-| `experiment_id` | `.experiment_id` | Direct copy. |
-| `fingerprint` | `.experiment_fingerprint` | Direct copy; `fingerprint_version = 1`. |
-| `name` | `.description` (fallback) OR `.metadata_json.legacy_name` | Legacy "name" is a free-form label; not used in v1 envelope schema. Preserved for traceability. |
-| `description` | `.description` | Direct copy (may concatenate with legacy name). |
-| `record_type` | `.record_type` | Direct copy; must be in v1 enum. Legacy `calibration`/`analysis` pass through. |
-| `created_at` | `.created_at` | Direct copy (legacy format is ISO 8601). |
-| `finalized_at` | `.finalized_at` | Direct copy (may be NULL for in-progress legacy records). |
-| `status` | `.status` | Direct copy. Legacy status values (`completed`, `failed`, etc.) match v1 enum. |
-| `config_files` (list) | `.artifacts[]` with `kind="config"` | One artifact per config file. `path` = absolute; `bytes` = file size; `sha256` computed at migration time. ★ |
-| `outputs` (dict of path→meta) | `.artifacts[]` | Flattened. Each output becomes one artifact row. `kind` inferred from path extension + heuristic. ★ |
-| `metrics` (dict: name→value) | `.metrics[]` long-format | `{name: v}` → `{family: <inferred>, name: name.upper(), value: v, split: null, horizon: null, epoch: null, tag: null}`. Family inferred via regex (`ic*` → regression, `sharpe*` → backtest_pnl, `acc*` → classification). ★ |
-| `upstream_experiment_ids` | `.upstream_ids` | Direct copy (JSON array of experiment_ids). |
-| `gates` (dict: gate→{status, threshold, observed}) | `.gates[]` list | One row per gate. `gate_order = index` in iteration order (legacy dict ordering is not guaranteed; fallback to alphabetical). ★ |
-| `tags` (list) | `.tags[]` | Direct copy. |
-| `git_state` (dict: commit, branch, dirty) | `.git` | Direct copy (key rename: `commit` → `commit_hash`). |
-| `data_paths` (list) | `.lineage[]` with `source_kind="raw_data"` OR `"export"` | Inferred. `source_hash` from `hash_directory_manifest(path)` if directory exists; else NULL. ★ |
-| `notes` (str) | `.notes` (top-level string) | Direct copy. Separately, if non-empty AND > 64 chars, a row is also inserted in `notes` table by the migration post-pass. |
-| `errors` (list) | `.metadata_json.legacy_errors` | v1 envelope has no `errors` field; preserved as escape-hatch. |
-| `duration_seconds` | `.wall_clock_ms` | Multiply by 1000; round to int. |
-| `parent_experiment_id` | `.parent_id` | Direct copy. |
-| `producer` (field may not exist in legacy) | `.producer` | Default: `"legacy-migrator"` if absent. ★ |
-| `producer_version` | `.producer_version` | Default: `"unknown"`. ★ |
-| `envelope_schema_version` | `.envelope_schema_version` | Hardcoded: `"0.0.0-legacy"`. ★ Explicitly signals v0 permissive path. |
-| `pipeline_contract_version` | `.pipeline_contract_version` | Default: `"2.2"` (current); override if legacy record specifies. |
-| `symbol` | `.symbol` | Default: `"NVDA"` (all 34 legacy records are NVDA). ★ |
-| `asset_class` | `.asset_class` | Default: `"equity"`. ★ |
-| `data_source_type` | `.data_source_type` | Inferred from `data_paths` + `producer`: `"mbo_lob_reconstructed"`, `"equity_off_exchange_trf"`, `"legacy-unknown"`. ★ |
-| `feature_schema_ref` | `.feature_schema_ref` | Inferred similarly; default `"legacy-unknown"`. ★ |
-| `json_record_path` | `.json_record_path` | Set at ingest time: `records/{experiment_id}.json`. |
-| `ingested_at` | `.ingested_at` | Set at ingest time: `now()`. |
-| `metadata_json` (any other dataclass field) | `.metadata_json.*` | Catch-all; forward-compatible. |
+| `provenance.git.commit_hash` | `.git.commit_hash` | Direct copy. `"not_git_tracked"` sentinel passes §3.2 regex. |
+| `provenance.git.branch` | `.git.branch` | Direct copy. |
+| `provenance.git.dirty` | `.git.dirty` | Direct copy (bool). |
+| `provenance.git.short_hash` | `.git.short_hash` | Direct copy. |
+| `provenance.config_hashes` (dict) | `.metadata_json.legacy_config_hashes` | `{extractor: sha, trainer: sha, manifest: sha}`. v1 doesn't hash config files separately (the extraction/training configs themselves are in `.config_source` or artifacts). Preserved for forensic comparison. |
+| `provenance.data_dir_hash` | `.lineage[]` with `source_kind="export"` or `"raw_data"`, `source_hash = <dir_hash>`, `source_name = <absolute_path>` | Creates ONE lineage row pointing back to the data directory. `source_repo` inferred from path prefix: `"databento-raw"` if under `data/raw/`, `"basic-quote-processor"` if under `data/exports/basic_*/`, etc. |
+| `provenance.contract_version` | (duplicate of record-level `.pipeline_contract_version`; drop if same value) | — |
+| `provenance.timestamp_utc` | `.metadata_json.legacy_provenance_timestamp` | Retained for audit comparison with `.created_at`. |
+| `provenance.retroactive` | `.metadata_json.legacy_retroactive = true` | v1 envelope has no `retroactive` field at top level; flagged in metadata_json. All 34 legacy records have `retroactive=true`. |
+| `provenance.schema_version` | `.metadata_json.legacy_provenance_schema_version` | Currently `"1.0"`. |
 
-**Fields in v1 envelope NOT present in legacy (defaulted to NULL/empty):**
-- `.heartbeat_at` (NULL — legacy doesn't stream)
-- `.dataset` (NULL — legacy doesn't track dataset identifier)
-- `.model_type`, `.model_family`, `.task` (NULL unless in `metadata_json`)
-- `.sampling_strategy`, `.sampling_config` (NULL)
-- `.label_family`, `.primary_horizon`, `.n_horizons`, `.horizons`, `.label_spec` (NULL)
-- `.config_source`, `.config_format` (legacy uses `config_files` artifacts instead)
-- `.sweep_id`, `.axis_values` (NULL — no sweeps retroactively)
-- `.bulk_parquet[]` (empty — legacy has no Parquet side files)
-- `.export_stats` (NULL — not captured in legacy)
-- `.cohort_hash` (computed by ingester post-insert; same path as v1)
+#### v1 envelope fields set by the migrator (not sourced from legacy)
 
-**Migration test (§18.5):** for each of 34 legacy records, verify:
-1. v0 envelope round-trips through the ingester without quarantine.
-2. `experiment_fingerprint` bytes-identical pre- and post-migration.
-3. Post-migration `records/{id}.json` contents are CANONICAL v1 form (not a copy of the legacy record).
-4. `SELECT COUNT(*) FROM experiments` = 34 after Step 2 completes.
-5. Rendered `EXPERIMENT_INDEX.md` sections for each legacy experiment semantically match the hand-written entries (field coverage, key metrics, gate results — fuzzy match, not byte-identical).
+| Envelope-v1 target | Value set by migrator | Rationale |
+|---|---|---|
+| `.envelope_version` | `1` | All migrated records use the v1 envelope. |
+| `.envelope_schema_version` | `"1.0.0"` | Current v1 schema version. |
+| `.producer` | `"legacy-migrator"` | Distinguishes migrated records from live producer emissions. §3.2 `producer` enum MUST include this entry for Phase 11. |
+| `.producer_version` | `"0.0.0"` | Sentinel for "legacy migrator v0". |
+| `.symbol` | `"NVDA"` | All 34 legacy records are NVDA (verified at migration time by inspecting the `training_config.data.symbol` fallback; quarantine with `.error` if symbol cannot be determined). |
+| `.symbols_json` | `null` | Single-symbol. |
+| `.asset_class` | `"equity"` | All 34 legacy records are NVDA equity. |
+| `.data_source_type` | Inferred from `training_config.data.source_type` OR from lineage.source_repo: `"equity_lob_mbo"` if producer touched MBO extractor, `"equity_off_exchange_trf"` if BQP, else `"legacy-unknown"`. | ★ |
+| `.feature_schema_ref` | Inferred: `"equity_v2.2"` for MBO records; `"off_exchange_1.0"` for BQP records; else `"legacy-unknown"`. | ★ |
+| `.json_record_path` | `records/{experiment_id}.json` | Set by ingester (§7.3). |
+| `.ingested_at` | `now()` UTC at migration time | Set by ingester. |
+| `.heartbeat_at` | `null` | Legacy doesn't stream. |
+| `.finalized_at` | `.created_at + timedelta(seconds=duration_seconds)` — reconstructed | Legacy has no explicit finalized_at; approximated from created_at + duration. |
+| `.dataset` | Inferred: `training_config.data.dataset_name` OR `null`. | |
+| `.bulk_parquet[]` | `[]` | Legacy has no Parquet side files. |
+| `.export_stats` | `null` (for non-export record_types); for export legacy records, best-effort extraction from `training_metrics` keys prefixed `export_stats.` | |
+| `.training_info` | For `record_type='training'` only: extracted from `training_config` + `training_metrics` (best_epoch, total_epochs, model_params). **`.training_info.normalization_*` left as `null`** — legacy records don't carry this (§14.8 invariant EXEMPTS `producer='legacy-migrator'`). | ★ |
+| `.signal_provenance` | For `record_type='backtest'` only: populated from `backtest_params` + parent_experiment_id. `.signal_provenance.trainer_fingerprint` looked up via `parent_experiment_id → experiments.experiment_fingerprint`. If lookup fails, ingest proceeds but §14.8 check is skipped (legacy-migrator exemption). | ★ |
+| `.cohort_hash` | Computed by ingester post-INSERT (same path as v1; §6.4). | |
+| `.gates[]` | `[]` (legacy records have no structured gate data — gates were narrative-only). | |
+| `.lineage[]` | Populated from `provenance.data_dir_hash` + `parent_experiment_id` (if non-empty → one extra lineage row with `source_kind="trainer_run"`, `source_hash = parent.experiment_fingerprint`). | ★ |
+| `.artifacts[]` | Populated from `extraction_config`, `training_config`, `backtest_params` (each serialized to a file under `archive/legacy/{exp_id}/` + hashed). | ★ |
+| `.metrics[]` | Long-format flattening of `training_metrics` + `backtest_metrics` + `dataset_health`. | ★ |
+
+#### Legacy-migrator exemptions from Phase 11 integrity gates
+
+The §14.8 (normalization_stats_sha256) and §14.9 (upstream fingerprint) invariants are HARD FAILS for live producers but EXEMPT for envelopes where `producer == "legacy-migrator"`. Rationale: the 34 retroactive records pre-date both conventions and retroactively fabricating hashes would break the §13.1 "fingerprints preserved verbatim" guarantee. Legacy exemption is enforced by adding `producer_version_exempt_from_integrity` to the ingester's policy module (Phase 11 deliverable).
+
+#### Migration test suite (§18.5, expanded)
+
+For each of the 34 legacy records:
+
+1. Load `records/{id}.json` → instantiate `ExperimentRecord` via `from_dict()`.
+2. Transform to envelope-v1 via `legacy_to_envelope_v1(record)`.
+3. Ingest via the standard §7.3 pipeline.
+4. Verify **byte-identical `experiment_fingerprint`** pre- and post-migration (§13.1 success criterion #2).
+5. Verify `SELECT COUNT(*) FROM experiments WHERE producer = 'legacy-migrator'` returns 34.
+6. Verify all 25 ExperimentRecord fields were mapped (no silent data loss; `.metadata_json.legacy_*` keys cover any field not mapped to a typed envelope slot).
+7. Re-render `EXPERIMENT_INDEX.md` section for each legacy experiment; fuzzy-match against the hand-written entry in `lob-model-trainer/EXPERIMENT_INDEX.md` (field coverage, key metrics, gate results — not byte-identical).
+8. Verify §14.8 / §14.9 integrity gates DO NOT fire (exempted by producer="legacy-migrator").
+9. Property test: replaying the migration twice is idempotent (inbox→records→SQLite path unchanged on second run).
 
 ### §13.2 Markdown Ledger Extraction
 
@@ -3102,8 +3327,8 @@ The following invariants MUST be preserved by Phase 10 implementation:
 
 ### §14.1 Fingerprint Algorithm (Phase 3.3b)
 
-- `compute_fingerprint()` logic at `hft-ops/src/hft_ops/ledger/dedup.py:174-281` is CANONICAL.
-- `_load_trainer_config_resolved()` (`dedup.py:65-109`) resolves `_base:` before hashing. Phase 10 does NOT bypass this.
+- `compute_fingerprint()` logic at `hft-ops/src/hft_ops/ledger/dedup.py:284-391` is CANONICAL.
+- `_load_trainer_config_resolved()` (`dedup.py:117-195`) resolves `_base:` before hashing via `lobtrainer.config.merge.resolve_inheritance` (`merge.py:85-182`). Phase 10 does NOT bypass this.
 - Inline and path-based trainer_config forms produce identical fingerprints. Phase 10 preserves.
 
 ### §14.2 Exclusion Set
@@ -3138,6 +3363,53 @@ hft-ops continues to NOT Python-import runner modules. Two soft exceptions (`lob
 ### §14.7 Stage Order
 
 Extraction → raw_analysis → dataset_analysis → validation → training → signal_export → backtesting. Phase 10 preserves this order for `hft-ops run`. The sweep runner v2 respects the same order per grid point.
+
+### §14.8 Normalization-Stats Integrity (Round 11 Agent B BQ3)
+
+**Invariant**: for any `record_type='backtest'` envelope `B` with `upstream_experiment_ids = [T_id, ...]`, the backtester's `signal_provenance.normalization_stats_sha256` MUST byte-equal the trainer's `training_info.normalization_stats_sha256` where the trainer is `experiments.experiment_id == T_id`.
+
+**Enforcement**: §7.6.1 rule 10 + a new dedicated check at ingest time:
+
+```python
+def check_normalization_integrity(validated: Envelope, conn: sqlite3.Connection) -> None:
+    """Raise IntegrityError if backtest's norm stats differ from its trainer's."""
+    if validated.record_type != "backtest":
+        return
+    if validated.signal_provenance is None or validated.signal_provenance.normalization_stats_sha256 is None:
+        if validated.signal_provenance and validated.signal_provenance.normalization_method in (None, "none"):
+            return  # trainer used raw features — no stats to check
+        raise IntegrityError("backtest missing signal_provenance.normalization_stats_sha256")
+
+    trainer_fp = validated.signal_provenance.trainer_fingerprint
+    row = conn.execute(
+        "SELECT metadata_json FROM experiments WHERE experiment_fingerprint = ?",
+        (trainer_fp,)
+    ).fetchone()
+    if row is None:
+        raise IntegrityError(f"trainer fingerprint {trainer_fp[:8]}... not in ledger")
+    trainer_meta = json.loads(row[0])
+    trainer_sha = trainer_meta.get("training_info", {}).get("normalization_stats_sha256")
+    if trainer_sha != validated.signal_provenance.normalization_stats_sha256:
+        raise IntegrityError(
+            f"normalization_stats_sha256 mismatch: trainer={trainer_sha[:8] if trainer_sha else 'NULL'}, "
+            f"backtest={validated.signal_provenance.normalization_stats_sha256[:8]}. "
+            f"This indicates train/inference stats drift under T15; backtest would produce silently-wrong signals."
+        )
+```
+
+**Rationale**: T15 "Raw Rust, Variable Python" means normalization is the **single largest source of silent train/inference divergence**. Without this check, two backtest envelopes with identical fingerprints could consume DIFFERENT normalization stats (e.g., if the trainer's checkpoint was re-saved with a different seed and stats got reshuffled). The fingerprint does NOT include normalization_stats because stats are runtime-computed, not config — so content-addressed identity cannot catch this class of bug. §14.8 closes the gap.
+
+**Test** (§18.2 Normalization integrity, 2 new tests):
+- Insert trainer envelope with `normalization_stats_sha256 = "abc..."`; then ingest backtest with matching sha → passes.
+- Ingest backtest with MISmatching sha → `IntegrityError`; ingest aborts; envelope quarantined with `.error` explaining the drift.
+
+### §14.9 Upstream Fingerprint Integrity (Round 11 Agent B BQ7)
+
+**Invariant**: every `lineage[].source_hash` that names an in-ledger producer experiment MUST resolve to exactly one `experiments.experiment_fingerprint` row (or to a `fingerprint_history.fingerprint_value` row). Free-form `source_name` references are permitted only for raw data (source_kind == "raw_data"), reconstructor output (source_kind == "reconstructor"), and other non-ledger artifacts.
+
+**Enforcement**: §7.6.2 warn-only rule 4 (upstream ingest ordering race) becomes §7.6.1 HARD-FAIL after a grace period. Phase 11 deploys as warn; Phase 13 promotes to hard-fail once producer rollouts stabilize (see §15 timeline).
+
+See §7.1.1 for the producer-side API that resolves upstream fingerprints at emit time.
 
 ---
 
@@ -3484,7 +3756,7 @@ One-off validation for Phase 11 Step 2:
 
 - `hft-ops/src/hft_ops/ledger/ledger.py:53-62` — current JSON-index rebuild.
 - `hft-ops/src/hft_ops/ledger/experiment_record.py:24-54,57-134` — current record shape + record_type enum.
-- `hft-ops/src/hft_ops/ledger/dedup.py:65-109,174-281` — fingerprint algorithm (§3.3b fix).
+- `hft-ops/src/hft_ops/ledger/dedup.py:117-195,284-391` — fingerprint algorithm (§3.3b fix); `lob-model-trainer/src/lobtrainer/config/merge.py:85-182` — `resolve_inheritance()` for `_base:` chains (lazy-loaded by dedup.py:73-114).
 - `hft-ops/src/hft_ops/manifest/sweep.py:44-121,157` — current sweep grid expansion + validation.
 - `hft-ops/src/hft_ops/manifest/schema.py:309-339` — SweepConfig dataclass.
 - `hft-ops/src/hft_ops/stages/base.py:138` — HFT_OPS_ORCHESTRATED env var.
@@ -3572,6 +3844,7 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 |---|---|---|
 | Draft v1 | 2026-04-15 | Initial draft synthesizing 9 validation rounds (~20 agent reports). |
 | Draft v1.1 — Round 10 | 2026-04-15 | Applied Round 10 validation findings (4 parallel agents: consistency / completeness / correctness / better-alternatives). See amended change list below. |
+| Draft v1.2 — Round 11 | 2026-04-15 | Applied Round 11 Tier-1 findings (4 parallel agents: radical alternatives / data-flow integrity / 5-year decay / code-reality alignment). All 7 Tier-1 items fixed. See Round 11 Tier-1 Amendments below. |
 
 ### Round 10 Amendments (v1 → v1.1)
 
@@ -3610,6 +3883,56 @@ Plus prior rounds' agents (Rounds 1-8) for Phase 9 context.
 - §4.5 TOML: all GateKeys use underscore form (no dot).
 - §3.2 JSON Schema: parses as Draft-07 JSON; source_commit pattern accepts both 7-char and 40-char SHAs AND the `not_git_tracked` sentinel.
 - §6.4 SQL blocks: no trailing commas; reference only valid columns.
+
+### Round 11 Tier-1 Amendments (v1.1 → v1.2)
+
+**Agent verdicts:** Agent A (radical alternatives) → CURRENT DESIGN OPTIMAL with one worth-exploring (A6 auto-render vs hand-narrative split — deferred). Agent B (data-flow integrity) → 7 silent-corruption risks, 3 CRITICAL/HIGH addressed in Tier-1. Agent C (5-year decay) → healthy through 10k experiments; top drift risks deferred to Phase 11+. Agent D (reality check vs code) → 9 stale refs + 1 CRITICAL factual error; all fixed.
+
+**Tier-1 must-fix (blocking Phase 11 code):**
+
+**T1 — §13.1b legacy field mapping rewritten from ground truth.** The v1.1 mapping table invented 18 field names that do not exist on `ExperimentRecord` (e.g., `config_files`, `outputs`, `metrics` as top-level dict, `upstream_experiment_ids`, `gates`, `git_state`, `data_paths`, `errors`) and omitted 9 fields that do exist (`manifest_path`, `extraction_config`, `training_config`, `backtest_params`, `dataset_health`, `hypothesis`, `stages_completed`, `sweep_id`, `axis_values`). Rewrote from direct read of `experiment_record.py:88-132` (25 dataclass fields) + `lineage.py:195-245` (Provenance sub-structure, 7 fields). Added per-field transformation rules, legacy-migrator exemption from §14.8/§14.9 integrity gates, and a 9-step migration test suite. Added `"legacy-migrator"` to `producer` enum.
+
+**T2 — Normalization state threading added to envelope.** Under T15 "Raw Rust, Variable Python", normalization is the single largest source of silent train/inference divergence. Added:
+- `training_info.normalization_method` (enum: none / hybrid / global_zscore / per_feature_minmax / market_structure_zscore)
+- `training_info.normalization_stats_sha256` (64-hex)
+- `training_info.normalization_source_split` (train / all / cv_folds)
+- Same three fields on `signal_provenance` + new `trainer_fingerprint` (64-hex, resolves upstream) + `signal_file_sha256`
+- New §14.8 "Normalization-Stats Integrity" invariant with enforcement pseudocode: backtester's `signal_provenance.normalization_stats_sha256` MUST byte-equal the upstream trainer's `training_info.normalization_stats_sha256`; ingest REJECTS on mismatch.
+
+**T3 — Upstream fingerprint threading.** v1.1 had no concrete API for retrieving the upstream trainer's `experiment_fingerprint` at backtester emit time. Added:
+- New §7.1.1 "Upstream Fingerprint Resolution API" with `.envelope-ref` breadcrumb-file protocol (Python + Rust implementations spec'd).
+- New §6.4a "Fingerprint Composition per record_type" table: backtest/training/evaluation/calibration fingerprints MUST include `sorted(upstream_fingerprints)` as a component. Prevents fingerprint collision across distinct upstream trainers with identical backtest params.
+- New §14.9 "Upstream Fingerprint Integrity" invariant: non-raw-data `lineage[].source_hash` MUST resolve to `experiments.experiment_fingerprint`.
+- §7.1 Producer Responsibilities updated: producers MUST call `resolve_upstream_ref()` and populate typed fingerprint fields (not free-form `source_name`) when the upstream is ledger-resident.
+
+**T4 — `n_features` / `feature_layout` / `feature_indices_subset` added to formal §3.2 JSON Schema.** Previously these fields appeared in the §3.3.5 MBO envelope example but were NOT in the schema — a producer emitting `n_features: 42` accidentally would validate silently and fail only at trainer load time with a cryptic shape-mismatch error. Added to `export_stats` properties with:
+- `n_features` (integer, ≥1, must be ≤ registered `total_count` in `feature_schema_ref`)
+- `feature_layout` (enum: "grouped" | "lobster")
+- `feature_indices_subset` (optional sorted integer array; NULL = all features)
+- New §7.6.1 hard-fail cross-field validations (11 rules) + §7.6.2 warn-only rules (6 rules). n_features subset check is rule #7. Related rules also cover symbol consistency, normalization-hash/method pairing, sub_records gating.
+
+**T5 — `pipeline_contract_version` invented value fixed.** v1.1 §3.3.1 BQP example claimed `pipeline_contract_version = "off_exchange_1.0"` but that string does not exist in `pipeline_contract.toml` — the actual value is `schema_version = "1.0"` under `[features.off_exchange]` (feature-specific) vs top-level `[contract].schema_version = "2.2"` (pipeline-wide). Fixed to `"2.2"` in the BQP example and tightened the JSON Schema with pattern `^\\d+\\.\\d+(\\.\\d+)?$` that rejects the legacy string. `feature_schema_ref` remains the per-producer schema slot.
+
+**T6 — File:line citations corrected.** v1.1 repeatedly cited:
+- `dedup.py:174-281` → should be `dedup.py:284-391` (compute_fingerprint)
+- `dedup.py:65-109` → should be `lob-model-trainer/src/lobtrainer/config/merge.py:85-182` (resolve_inheritance lives in a different file entirely)
+- `dedup.py:253-257` → should be `dedup.py:255-282` (_extract_fingerprint_fields) + `dedup.py:364-368` (validation-exclusion comment)
+- `dedup.py:94-100` → should be `dedup.py:95-99` (return-None path inside `_load_trainer_merge_module`)
+Fixed throughout §1.1, §3.3, §6, §14, §19.
+
+**T7 — Stale stats corrected.** "`ExperimentRecord` dataclass ... with 20 fields" → 25 fields (enumerated). "4 of 17 orthogonal bases created" → 21 bases across 4 categories (8 datasets, 4 labels, 5 models, 4 train).
+
+**Validation**: all 7 Tier-1 fixes verified by a 31-check Python self-audit (DDL re-parse + TOML re-parse + JSON Schema re-parse + 5 producer envelope re-parse + field presence checks + invented-claim absence checks). Round 10 regressions confirmed green. See `hft-architect` agent reports + `doc-alignment-auditor` report in session 0b055834.
+
+**Tier-2 items deferred to Phase 11 Week 1:**
+- (B1) Z-timezone pattern enforcement on all ISO 8601 fields
+- (B6) Parquet-before-envelope ordering + §7.4.1 Parquet state in recovery matrix
+- (B8) First-class `exchange` field on envelope
+- (C-FF6) JSON Schema codegen from TOML + CI drift-check
+- (C-SC8) Cross-repo contract-bump coordination playbook
+- (C-FF7) `metadata_json.<producer>.*` namespace convention
+
+**Tier-3 items deferred (not blocking):** A6 summary/narrative split, C-SC2 bi-level Parquet partitioning (year-5), C-SC3 OPRA option fields (when OPRA ships), C-FF3 debounce-constants parameterization.
 
 ---
 
