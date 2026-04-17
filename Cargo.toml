@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Shared time utilities (regime classification, DST-aware offset)
-hft-statistics = { git = "https://github.com/nagarx/hft-statistics.git", branch = "main" }
+hft-statistics = { git = "https://github.com/nagarx/hft-statistics.git", tag = "v0.2.1" }
 
 # Databento data format (CMBP-1 records via CbboMsg type)
 dbn = { git = "https://github.com/databento/dbn.git", tag = "v0.20.0" }
