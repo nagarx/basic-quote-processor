@@ -23,11 +23,29 @@ fn test_file_path() -> std::path::PathBuf {
 }
 
 fn data_available() -> bool {
-    test_file_path().exists()
+    let exists = test_file_path().exists();
+    // L-10 fix: in CI, missing data must fail hard (not silent skip).
+    if !exists && std::env::var("CI").is_ok() {
+        panic!(
+            "Test data required for CI runs but missing at expected path {:?}. \
+             Either provide data at {} or unset CI env var for local testing.",
+            test_file_path(), DATA_DIR
+        );
+    }
+    exists
 }
 
 fn equs_available() -> bool {
-    Path::new(EQUS_PATH).exists()
+    let exists = Path::new(EQUS_PATH).exists();
+    // L-10 fix: EQUS context tests also fail hard in CI without data.
+    if !exists && std::env::var("CI").is_ok() {
+        panic!(
+            "EQUS_SUMMARY data required for CI runs but missing at expected path {}. \
+             Either provide data or unset CI env var for local testing.",
+            EQUS_PATH
+        );
+    }
+    exists
 }
 
 fn test_config() -> ProcessorConfig {

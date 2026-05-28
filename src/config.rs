@@ -397,10 +397,13 @@ fn default_sigma_window() -> u32 { 1 }
 
 /// Empty bin policy for bins with no TRF trades.
 ///
-/// NOTE: Only `ForwardFillState` is currently implemented in `features/mod.rs`.
-/// `ZeroAll` and `NanAll` are accepted by config parsing but the feature
-/// extraction always runs the forward-fill path. Implementing the other
-/// policies is deferred — this enum makes the dead-config status explicit.
+/// NOTE: Only `ForwardFillState` is currently implemented. `ZeroAll` and `NanAll`
+/// parse from TOML but are REJECTED by `ValidationConfig::validate()` per
+/// hft-rules §5 (fail-fast on unsupported config options — never silently degrade).
+/// Implementing the other policies requires (a) threading `empty_bin_policy` from
+/// `ValidationConfig` into `FeatureExtractor` and (b) replacing the unconditional
+/// `acc.forward_fill.apply_to(...)` call at `features/mod.rs::extract` (the only
+/// empty-bin code path today) with a match dispatch on the policy variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EmptyBinPolicy {
@@ -482,6 +485,17 @@ impl ValidationConfig {
             return Err(ProcessorError::config(
                 "close_detection_gap_bins must be >= 1",
             ));
+        }
+        // Per hft-rules §5: fail-fast on unsupported config options.
+        // ZeroAll and NanAll parse from TOML but the feature extractor only
+        // implements ForwardFillState. Reject until the other paths are wired.
+        if !matches!(self.empty_bin_policy, EmptyBinPolicy::ForwardFillState) {
+            return Err(ProcessorError::config(format!(
+                "empty_bin_policy {:?} is not yet implemented in the feature \
+                 extractor; only ForwardFillState is supported. See the \
+                 EmptyBinPolicy doc for status.",
+                self.empty_bin_policy
+            )));
         }
         Ok(())
     }
@@ -897,6 +911,42 @@ mod tests {
         let toml_str = r#"empty_bin_policy = "invalid""#;
         let result: std::result::Result<ValidationConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err(), "Unknown empty_bin_policy must fail at deserialization");
+    }
+
+    #[test]
+    fn test_empty_bin_policy_zero_all_rejected_until_implemented() {
+        // hft-rules §5: dead-config must fail fast, not silently degrade.
+        let config = ValidationConfig {
+            empty_bin_policy: EmptyBinPolicy::ZeroAll,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not yet implemented"),
+            "ZeroAll must be rejected with clear message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_bin_policy_nan_all_rejected_until_implemented() {
+        let config = ValidationConfig {
+            empty_bin_policy: EmptyBinPolicy::NanAll,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not yet implemented"),
+            "NanAll must be rejected with clear message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_bin_policy_forward_fill_state_accepted() {
+        let config = ValidationConfig {
+            empty_bin_policy: EmptyBinPolicy::ForwardFillState,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

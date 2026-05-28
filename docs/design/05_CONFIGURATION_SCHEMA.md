@@ -126,7 +126,7 @@ bbo_staleness_max_ns = 5_000_000_000
 warmup_bins = 3
 block_threshold = 10_000
 burst_threshold = 20
-empty_bin_policy = "forward_fill_state"    # one of "forward_fill_state","zero_all","nan_all"
+empty_bin_policy = "forward_fill_state"    # only "forward_fill_state" is accepted by validate(); "zero_all" and "nan_all" parse but are rejected
 auto_detect_close = true
 close_detection_gap_bins = 10              # default: 10 (10 minutes at 60s bins)
 
@@ -585,7 +585,7 @@ Controls data quality gates, warmup, and empty-bin handling.
 | `warmup_bins` | u32 | `3` | (no validation) | Number of bins to discard at the start of each trading day. |
 | `block_threshold` | u32 | `10_000` | `> 0` | Trade size threshold for block detection (used by `block_trade_ratio` feature). |
 | `burst_threshold` | u32 | `20` | (no validation) | TRF trades per 1-second window to trigger burst detection. |
-| `empty_bin_policy` | string (enum) | `"forward_fill_state"` | `"forward_fill_state"`, `"zero_all"`, `"nan_all"` | How to handle bins with zero TRF trades. |
+| `empty_bin_policy` | `EmptyBinPolicy` enum (snake_case in TOML) | `"forward_fill_state"` | `"forward_fill_state"` | How to handle bins with zero TRF trades. **`"zero_all"` and `"nan_all"` parse but are REJECTED by `ValidationConfig::validate()` per hft-rules §5 — they remain enum variants for forward-compat but are not implemented in `features/mod.rs`.** |
 | `auto_detect_close` | bool | `true` | -- | If true, the pipeline detects early market close (NYSE half-days: July 3, day after Thanksgiving, Christmas Eve) by monitoring for consecutive empty bins. |
 | `close_detection_gap_bins` | u32 | `10` | `>= 1` | Number of consecutive bins with zero activity before declaring the trading day complete. **Default 10** at 60s bins = 10 minutes; chosen to avoid LULD halt false positives. Only used when `auto_detect_close = true`. |
 
@@ -601,11 +601,11 @@ Distinguishes between state features and flow features:
 | Safety gates | bin_valid | 0.0 | Below `min_trades_per_bin` by definition. |
 | Safety gates | bbo_valid | Computed from BBO staleness | BBO may still be valid even if no trades occurred. |
 
-**`zero_all`**:
-All features set to 0.0 for empty bins. Simpler but loses the distinction between "no trades = neutral flow" and "no trades = unknown state."
+**`zero_all`** (NOT IMPLEMENTED — REJECTED by `ValidationConfig::validate()`):
+All features set to 0.0 for empty bins. Simpler but loses the distinction between "no trades = neutral flow" and "no trades = unknown state." Listed for forward-compat; `validate()` rejects this variant with `"empty_bin_policy ZeroAll is not yet implemented..."` per hft-rules §5 (fail-fast on unsupported config).
 
-**`nan_all`**:
-All features set to NaN for empty bins. Requires downstream NaN handling (imputation or masking). Useful for analysis but not recommended for model training without explicit NaN strategy.
+**`nan_all`** (NOT IMPLEMENTED — REJECTED by `ValidationConfig::validate()`):
+All features set to NaN for empty bins. Requires downstream NaN handling (imputation or masking). Useful for analysis but not recommended for model training without explicit NaN strategy. Same status as `zero_all` — accepted by parser, rejected by `validate()`.
 
 ### Rationale
 
@@ -684,7 +684,7 @@ The following values are hardcoded constants that must NOT be exposed as configu
 |----------|-------|------|-----------|
 | `EPS` | `1e-8` | f64 | Division guard for all denominators. Consistent across all pipeline modules. Changing this value would alter the numerical behavior of every feature computation. |
 | `SCHEMA_VERSION` | `1.0` | f64 | Schema version for off-exchange features. Emitted at feature index 33. Changing requires a contract version bump and synchronized updates in all consumers. |
-| `CONTRACT_VERSION` | `"off_exchange_1.0"` | &str | Off-exchange contract version string. Independent of MBO schema version (2.2). |
+| `CONTRACT_VERSION` | `"off_exchange_1.0"` | &str | Off-exchange contract version string. Independent of MBO schema version (3.0). |
 | `NANO_TO_USD` | `1e-9` | f64 | Multiplier for converting i64 nanodollar wire prices to f64 USD. Defined by the Databento CMBP-1 schema (`dbn::FIXED_PRICE_SCALE` is its reciprocal `i64 = 1_000_000_000`). Not a pipeline choice. |
 | `UNDEF_PRICE` | `i64::MAX` | i64 | Sentinel value for undefined/missing prices in the dbn crate. Records with this value are rejected at the BBO update boundary. |
 | Sign convention | `> 0 = Bullish` | -- | All signed features follow `> 0 = bullish, < 0 = bearish, = 0 = neutral`. Enforced in contract tests. Consistent with the MBO pipeline. |
@@ -727,8 +727,11 @@ All validation occurs at config parse time in `ProcessorConfig::from_toml()` (si
 
 | Rule | Error Message |
 |------|---------------|
-| `strategy` must equal `"time_based"` | `"Unknown sampling strategy '{}'; only 'time_based' is supported"` |
+| `strategy` must be known `SamplingStrategy` variant | Enforced at serde deserialization (typed enum): `"unknown variant 'X', expected 'time_based'"`. Runtime validate() no longer checks strategy. |
 | `bin_size_seconds` must be in `{5, 10, 15, 30, 60, 120, 300, 600}` | `"bin_size_seconds ({}) must be one of [5, 10, ..., 600]"` |
+| `market_open_et` parseable as `HH:MM` | `"market_open_et: 'X' is not HH:MM format"` / `"hours (N) must be < 24"` / `"minutes (N) must be < 60"` (since commit 8e46608) |
+| `market_close_et` parseable as `HH:MM` | Same error patterns as `market_open_et` |
+| `close_secs > open_secs` | `"market_close_et ('A' = Xs) must be after market_open_et ('B' = Ys)"` (since commit 8e46608) |
 
 ### Classification Validation (`ClassificationConfig::validate`)
 
@@ -746,8 +749,19 @@ All validation occurs at config parse time in `ProcessorConfig::from_toml()` (si
 | `min_trades_per_bin > 0` | `"min_trades_per_bin must be > 0"` |
 | `bbo_staleness_max_ns > 0` | `"bbo_staleness_max_ns must be > 0"` |
 | `block_threshold > 0` | `"block_threshold must be > 0"` |
-| `empty_bin_policy` in `{"forward_fill_state", "zero_all", "nan_all"}` | `"empty_bin_policy '{}' must be one of [\"forward_fill_state\", \"zero_all\", \"nan_all\"]"` |
+| Unknown `empty_bin_policy` string | Enforced at serde deserialization (typed enum): `"unknown variant 'X', expected one of 'forward_fill_state', 'zero_all', 'nan_all'"` |
+| `empty_bin_policy` must be `ForwardFillState` | `"empty_bin_policy X is not yet implemented in the feature extractor; only ForwardFillState is supported."` — `ZeroAll`/`NanAll` rejected per hft-rules §5 |
 | `close_detection_gap_bins >= 1` | `"close_detection_gap_bins must be >= 1"` |
+
+### Cross-Config Validation (`ProcessorConfig::validate`)
+
+Added in commit 8e46608. These checks run after each sub-config's individual `validate()` and enforce inter-section invariants:
+
+| Rule | Error Message |
+|------|---------------|
+| `vpin.bucket_volume > 0` when `features.vpin = true` | `"vpin.bucket_volume must be > 0 when features.vpin is enabled"` |
+| `vpin.lookback_buckets > 0` when `features.vpin = true` | `"vpin.lookback_buckets must be > 0 when features.vpin is enabled"` |
+| `validation.burst_threshold >= 1` when `features.cross_venue = true` | `"validation.burst_threshold must be >= 1 when features.cross_venue is enabled"` |
 
 ### Sequence Validation (`SequenceConfig::validate`)
 

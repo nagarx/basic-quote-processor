@@ -2,8 +2,8 @@
 
 Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
-**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (471 tests: 408 lib + 63 integration)
-**Schema**: off_exchange 1.0 (independent of MBO schema 2.2)
+**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (475 tests: 412 lib + 63 integration)
+**Schema**: off_exchange 1.0 (independent of MBO schema 3.0)
 **Features**: 34 (indices 0-33), 10 groups
 **Labels**: Point-return only (no smoothed), 8 horizons [1,2,3,5,10,20,30,60]
 
@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 471 tests
-cargo test --lib               # Run 408 lib tests only
+cargo test                     # Run all 475 tests
+cargo test --lib               # Run 412 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -224,7 +224,7 @@ These were identified during a 3-agent deep audit of all 41 source files. None a
 - **TRADE_COUNT (idx 22) and BIN_TRADE_COUNT (idx 27) produce identical values** — both compute `total_trades`. One is in the toggleable trade_size group, the other in the always-on activity group. Removing requires schema version bump.
 - **`finalize()` does not dispatch on `LabelStrategy` enum** — always uses `LabelComputer` (PointReturn). Latent: only one variant exists. Fix when adding second label strategy.
 - **Config structs lack `Serialize` derive** — ~~`ProcessorConfig` has `Deserialize` but not `Serialize`~~. **RESOLVED in Phase 9.3** — all 14 config structs/enums now derive `Serialize`. `ProcessorConfig::to_canonical_toml()` is the single canonical serialization path, and `ProcessorConfig::config_hash_hex()` provides a 64-char SHA-256 for provenance.
-- **`SamplingConfig.strategy` and `ValidationConfig.empty_bin_policy` are String, not enum** — validated at runtime against hardcoded lists. Should be proper Rust enums for type-level safety.
+- **`SamplingConfig.strategy` and `ValidationConfig.empty_bin_policy` are String, not enum** — **RESOLVED in commit 8e46608 (2026-05-28)** — both are now typed Rust enums (`SamplingStrategy::TimeBased`, `EmptyBinPolicy::{ForwardFillState, ZeroAll, NanAll}`) with `#[serde(rename_all = "snake_case")]`. TOML wire-format is byte-identical (config_hash preserved; golden hash regression test pins `c142f466...`). Unknown variants fail at serde deserialization. **Follow-up (post-commit)**: `EmptyBinPolicy::{ZeroAll, NanAll}` are not implemented in `features/mod.rs`; `ValidationConfig::validate()` now fail-fast rejects them per hft-rules §5.
 - **No `Sampler` trait** — `TimeBinSampler` is hardwired in `pipeline.rs`. Extract trait when adding volume-based or composite sampling.
 - **BVC uses sample variance (n-1), BurstTracker uses population variance (n)** — both defensible for their contexts (BVC estimates population parameter from sample, BurstTracker is descriptive statistic of bin data).
 - **`ExportMetadata.normalization.strategy` is hardcoded to `"per_day_zscore"`** — **RESOLVED in Phase 9.5** — strategy is now configurable via `ExportMetadataBuilder::normalization_strategy(&str)` and defaults to `"none"`. The CLI (`export_dataset.rs`) threads `config.export.normalization` into the builder via `DayPipeline::set_normalization_strategy(String)`.
@@ -242,15 +242,15 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 2. **DST transition tests** — `TimeBinSampler::init_day(2025, 3, 9)` (spring forward) and `(2025, 11, 2)` (fall back); verify offset switches.
 3. **File with only trades, no quotes** — verify `TradeClassifier` correctly returns `Unsigned + Unknown` for all trades when no BBO updates exist.
 4. **Truly empty `.dbn.zst` file** — current `test_edge_empty_iterator` uses `.take(0)`; need a test on a zero-record file.
-5. **Convert `debug_assert!` → `assert!` in `src/features/mod.rs:164-179`** for safety_gates, schema_version, session_progress range — currently invariants are stripped in release builds.
+5. **Convert `debug_assert!` → `assert!` in `src/features/mod.rs:164-179`** for safety_gates, schema_version, session_progress range — **RESOLVED in commit 8e46608 (2026-05-28)** — 6 `debug_assert!` calls promoted to `assert!`, enforcing `bin_valid`, `bbo_valid`, `schema_version`, `session_progress` invariants in release builds. One `debug_assert!` for `extract_context` regime sanity remains intentional (covered by `match` exhaustiveness).
 6. **Sign convention contract test** — explicit per-feature: `buy_vol > sell_vol` ⇒ `trf_signed_imbalance > 0`; same for mroib, bvc_imbalance, quote_imbalance.
 7. **VPIN below bucket_volume fallback** — feed one trade; verify `trf_vpin = 0.0` (not NaN).
 8. **Gap-bin-at-end-of-day** — synthetic stream where the last emitted bin is a gap; verify `last_bin_end_ns` reflects the gap.
 9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.
-10. **Integration test gating** — currently silently SKIP without data; add `CI=true` panic to prevent silent zero-coverage CI runs.
+10. **Integration test gating** — **RESOLVED in this commit (PARTIAL)** — all 5 integration test files (`classifier_test`, `integration_test`, `phase3_test`, `phase4_test`, `phase5_test`) now panic if data is missing AND `CI` env var is set, preserving local-dev silent-skip behavior otherwise. Same pattern applied to `equs_available()` in phase5_test. Note: a few orphan path-checks (e.g., `test_discover_files`, second-day path in `classifier_test::test_no_state_leakage_between_days`) bypass `data_available()` and remain silent-skip — fix in a follow-up.
 11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback.
 12. **`git_commit` / `git_dirty` provenance via `build.rs`** — currently metadata emits `processor_version` (from `env!("CARGO_PKG_VERSION")`) but no git commit hash. Phase 10 will add a `build.rs` script that shells to `git rev-parse HEAD` at compile time and exposes via `env!("GIT_COMMIT")`.
-13. **Frozen golden-hash regression test** — assert that a fixed-config input produces a known 64-char hex hash (Phase 10, detects accidental drift from serde_derive or toml minor version bumps).
+13. **Frozen golden-hash regression test** — **RESOLVED in commit 8e46608 (2026-05-28)** — `test_config_hash_golden_regression` in `src/config.rs` pins SHA-256 `c142f46663ae401bd9ae3250b3f7e9d3047b09db425d19050aecfdbb22ea11fa` for the `sample_processor_config()` fixture; detects drift from serde_derive, toml minor version bumps, or accidental struct-field reordering.
 14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+).
 15. **`validate_off_exchange_export_contract`** (Python consumer) does not yet validate the `forward_prices` block presence/shape — add in `hft-contracts` alongside Phase 10.
 

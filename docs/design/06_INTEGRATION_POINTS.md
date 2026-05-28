@@ -625,7 +625,7 @@ When adding off-exchange features to the pipeline contract, follow this checklis
 - [ ] Update root `CLAUDE.md` feature index layout section with off-exchange reference (parent HFT-pipeline-v2 repo)
 - [ ] Verify `pip install -e .` in `hft-contracts/` still passes all tests
 
-**Contract version note**: The off-exchange feature space has its own `schema_version` (starting at `"1.0"`), independent of the MBO `schema_version` (`"2.2"`). This allows the two feature spaces to evolve independently. The pipeline-level `contract.schema_version` (`"2.2"`) does NOT need to bump for off-exchange changes -- only for MBO stable feature changes.
+**Contract version note**: The off-exchange feature space has its own `schema_version` (starting at `"1.0"`), independent of the MBO `schema_version` (`"3.0"`). This allows the two feature spaces to evolve independently. The pipeline-level `contract.schema_version` (`"3.0"`) does NOT need to bump for off-exchange changes -- only for MBO stable feature changes.
 
 ---
 

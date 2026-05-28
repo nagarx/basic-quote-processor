@@ -22,7 +22,18 @@ fn test_file_path() -> std::path::PathBuf {
 }
 
 fn data_available() -> bool {
-    test_file_path().exists()
+    let exists = test_file_path().exists();
+    // L-10 fix: in CI, missing data must be a hard failure, not a silent skip.
+    // Local dev (CI env var unset) still skips gracefully so `cargo test` on a
+    // fresh clone passes without requiring Databento data.
+    if !exists && std::env::var("CI").is_ok() {
+        panic!(
+            "Test data required for CI runs but missing at expected path {:?}. \
+             Either provide data at {} or unset CI env var for local testing.",
+            test_file_path(), DATA_DIR
+        );
+    }
+    exists
 }
 
 /// Process a full day and return the classifier with diagnostic counters.
