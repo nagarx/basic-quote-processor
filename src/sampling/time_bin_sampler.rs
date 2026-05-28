@@ -26,8 +26,6 @@
 use hft_statistics::time::regime::utc_offset_for_date;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
-const NS_PER_MIN: u64 = 60 * NS_PER_SEC;
-const NS_PER_HOUR: u64 = 3600 * NS_PER_SEC;
 
 /// Completed bin boundary information.
 #[derive(Debug, Clone)]
@@ -82,10 +80,18 @@ impl TimeBinSampler {
     ///
     /// # Arguments
     /// * `year`, `month`, `day` — Trading date (e.g., 2025, 2, 3)
-    pub fn init_day(&mut self, year: i32, month: u32, day: u32) {
+    /// * `open_et_secs` — Market open as seconds since midnight ET (e.g., 34200 for 09:30)
+    /// * `close_et_secs` — Market close as seconds since midnight ET (e.g., 57600 for 16:00)
+    pub fn init_day(
+        &mut self,
+        year: i32,
+        month: u32,
+        day: u32,
+        open_et_secs: u32,
+        close_et_secs: u32,
+    ) {
         self.utc_offset_hours = utc_offset_for_date(year, month, day);
 
-        // Compute midnight UTC for the trading date using chrono
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
             .expect("Invalid date for init_day");
         let midnight_utc = date
@@ -95,19 +101,16 @@ impl TimeBinSampler {
             .timestamp_nanos_opt()
             .expect("Timestamp overflow") as u64;
 
-        // Convert 09:30 ET to UTC nanoseconds:
-        // market_open_utc = midnight_utc + (09:30_secs - utc_offset_secs) * NS_PER_SEC
-        // Since utc_offset is negative (-4 or -5), subtracting it adds hours.
-        // EST (-5): 09:30 + 5h = 14:30 UTC. EDT (-4): 09:30 + 4h = 13:30 UTC.
-        let open_et_secs: i64 = 9 * 3600 + 30 * 60; // 34200 seconds
+        // Convert ET seconds to UTC nanoseconds.
+        // utc_offset is negative (-4 EDT or -5 EST), so subtracting it adds hours.
+        // EST (-5): 09:30 ET + 5h = 14:30 UTC.  EDT (-4): 09:30 ET + 4h = 13:30 UTC.
         let offset_secs: i64 = self.utc_offset_hours as i64 * 3600;
-        let open_utc_secs = open_et_secs - offset_secs; // seconds from midnight UTC
+        let open_utc_secs = open_et_secs as i64 - offset_secs;
         self.market_open_ns = midnight_utc + open_utc_secs as u64 * NS_PER_SEC;
 
-        // Market close: 16:00 ET = market_open + 6.5 hours
-        self.market_close_ns = self.market_open_ns + 6 * NS_PER_HOUR + 30 * NS_PER_MIN;
+        let close_utc_secs = close_et_secs as i64 - offset_secs;
+        self.market_close_ns = midnight_utc + close_utc_secs as u64 * NS_PER_SEC;
 
-        // First bin boundary
         self.next_boundary_ns = self.market_open_ns + self.bin_size_ns;
         self.current_bin_index = 0;
         self.initialized = true;
@@ -206,11 +209,16 @@ impl TimeBinSampler {
 mod tests {
     use super::*;
 
+    const NS_PER_MIN: u64 = 60 * NS_PER_SEC;
+    const NS_PER_HOUR: u64 = 3600 * NS_PER_SEC;
+    const OPEN_SECS: u32 = 9 * 3600 + 30 * 60;  // 09:30 ET = 34200s
+    const CLOSE_SECS: u32 = 16 * 3600;           // 16:00 ET = 57600s
+
     #[test]
     fn test_init_day_est() {
         let mut sampler = TimeBinSampler::new(60);
         // 2025-02-03 is EST (offset = -5)
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         assert_eq!(sampler.utc_offset_hours(), -5, "February should be EST");
 
         // 09:30 EST = 14:30 UTC = 14*3600 + 30*60 = 52200 seconds past midnight
@@ -228,7 +236,7 @@ mod tests {
     fn test_init_day_edt() {
         let mut sampler = TimeBinSampler::new(60);
         // 2025-06-16 is EDT (offset = -4)
-        sampler.init_day(2025, 6, 16);
+        sampler.init_day(2025, 6, 16, OPEN_SECS, CLOSE_SECS);
         assert_eq!(sampler.utc_offset_hours(), -4, "June should be EDT");
 
         // 09:30 EDT = 13:30 UTC
@@ -246,8 +254,8 @@ mod tests {
     fn test_est_edt_differ_by_one_hour() {
         let mut sampler_est = TimeBinSampler::new(60);
         let mut sampler_edt = TimeBinSampler::new(60);
-        sampler_est.init_day(2025, 2, 3);  // EST
-        sampler_edt.init_day(2025, 6, 16); // EDT
+        sampler_est.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);  // EST
+        sampler_edt.init_day(2025, 6, 16, OPEN_SECS, CLOSE_SECS); // EDT
         // EST open is 1 hour later in UTC than EDT open (same local time)
         // But these are different dates, so compare the offset effect:
         // EST: 09:30 + 5h = 14:30 UTC, EDT: 09:30 + 4h = 13:30 UTC
@@ -263,7 +271,7 @@ mod tests {
     #[test]
     fn test_no_boundary_within_first_bin() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         // Record 30s into first bin → no boundary
@@ -273,7 +281,7 @@ mod tests {
     #[test]
     fn test_boundary_at_exact_edge() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         // Record at exactly the first bin boundary (open + 60s)
@@ -287,7 +295,7 @@ mod tests {
     #[test]
     fn test_boundary_past_edge() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         // Record 10s past boundary
@@ -299,7 +307,7 @@ mod tests {
     #[test]
     fn test_gap_three_bins() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         // First record at open + 30s → no boundary
@@ -317,7 +325,7 @@ mod tests {
     #[test]
     fn test_pre_market_returns_none() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         // Pre-market: 1 minute before open
@@ -328,7 +336,7 @@ mod tests {
     #[test]
     fn test_post_market_returns_none() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let close = sampler.market_close_ns();
 
         // At market close
@@ -339,7 +347,7 @@ mod tests {
     #[test]
     fn test_bin_midpoint() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         let boundary = sampler.check_boundary(open + 60 * NS_PER_SEC).unwrap();
@@ -350,7 +358,7 @@ mod tests {
     #[test]
     fn test_is_in_session_at_open() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let open = sampler.market_open_ns();
 
         assert!(sampler.is_in_session(open), "Exactly at open: IN session");
@@ -360,7 +368,7 @@ mod tests {
     #[test]
     fn test_is_in_session_at_close() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         let close = sampler.market_close_ns();
 
         assert!(!sampler.is_in_session(close), "Exactly at close: NOT in session");
@@ -370,7 +378,7 @@ mod tests {
     #[test]
     fn test_reset_clears_state() {
         let mut sampler = TimeBinSampler::new(60);
-        sampler.init_day(2025, 2, 3);
+        sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
         assert!(sampler.is_in_session(sampler.market_open_ns()));
 
         sampler.reset();

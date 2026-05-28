@@ -176,7 +176,11 @@ impl DayPipeline {
     /// (DST-aware via `utc_offset_for_date`).
     pub fn init_day(&mut self, year: i32, month: u32, day: u32) {
         self.day_str = format!("{:04}-{:02}-{:02}", year, month, day);
-        self.sampler.init_day(year, month, day);
+        self.sampler.init_day(
+            year, month, day,
+            self.config.sampling.open_et_seconds(),
+            self.config.sampling.close_et_seconds(),
+        );
         self.extractor.init_day(
             self.sampler.utc_offset_hours(),
             self.sampler.market_open_ns(),

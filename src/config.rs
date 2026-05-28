@@ -45,7 +45,7 @@ impl ProcessorConfig {
         Ok(config)
     }
 
-    /// Validate all sub-configs.
+    /// Validate all sub-configs and cross-config constraints.
     pub fn validate(&self) -> Result<()> {
         self.sampling.validate()?;
         self.classification.validate()?;
@@ -53,6 +53,24 @@ impl ProcessorConfig {
         self.sequence.validate()?;
         self.labeling.validate()?;
         self.vpin.validate()?;
+
+        if self.features.vpin {
+            if self.vpin.bucket_volume == 0 {
+                return Err(ProcessorError::config(
+                    "vpin.bucket_volume must be > 0 when features.vpin is enabled",
+                ));
+            }
+            if self.vpin.lookback_buckets == 0 {
+                return Err(ProcessorError::config(
+                    "vpin.lookback_buckets must be > 0 when features.vpin is enabled",
+                ));
+            }
+        }
+        if self.features.cross_venue && self.validation.burst_threshold < 1 {
+            return Err(ProcessorError::config(
+                "validation.burst_threshold must be >= 1 when features.cross_venue is enabled",
+            ));
+        }
         Ok(())
     }
 
@@ -137,6 +155,17 @@ fn default_symbol() -> String {
     "NVDA".to_string()
 }
 
+/// Sampling strategy.
+///
+/// Currently only `TimeBased` is supported. Enum for type-level safety
+/// (previously a `String` with runtime validation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingStrategy {
+    #[default]
+    TimeBased,
+}
+
 /// Time-bin sampling configuration.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [sampling]
@@ -144,15 +173,15 @@ fn default_symbol() -> String {
 #[serde(deny_unknown_fields)]
 pub struct SamplingConfig {
     /// Sampling strategy. Currently only "time_based" is supported.
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
+    #[serde(default)]
+    pub strategy: SamplingStrategy,
     /// Bin size in seconds. Must be one of {5, 10, 15, 30, 60, 120, 300, 600}.
     #[serde(default = "default_bin_size")]
     pub bin_size_seconds: u32,
-    /// Market open time in ET (HH:MM format).
+    /// Market open time in ET (HH:MM format). Wired into TimeBinSampler.
     #[serde(default = "default_market_open")]
     pub market_open_et: String,
-    /// Market close time in ET (HH:MM format).
+    /// Market close time in ET (HH:MM format). Wired into TimeBinSampler.
     #[serde(default = "default_market_close")]
     pub market_close_et: String,
 }
@@ -160,7 +189,7 @@ pub struct SamplingConfig {
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
-            strategy: default_strategy(),
+            strategy: SamplingStrategy::default(),
             bin_size_seconds: default_bin_size(),
             market_open_et: default_market_open(),
             market_close_et: default_market_close(),
@@ -171,12 +200,6 @@ impl Default for SamplingConfig {
 impl SamplingConfig {
     /// Validate sampling configuration.
     pub fn validate(&self) -> Result<()> {
-        if self.strategy != "time_based" {
-            return Err(ProcessorError::config(format!(
-                "Unknown sampling strategy '{}'; only 'time_based' is supported",
-                self.strategy
-            )));
-        }
         const VALID_BIN_SIZES: &[u32] = &[5, 10, 15, 30, 60, 120, 300, 600];
         if !VALID_BIN_SIZES.contains(&self.bin_size_seconds) {
             return Err(ProcessorError::config(format!(
@@ -184,11 +207,52 @@ impl SamplingConfig {
                 self.bin_size_seconds, VALID_BIN_SIZES
             )));
         }
+        let open_secs = parse_hhmm(&self.market_open_et).map_err(|e| {
+            ProcessorError::config(format!("market_open_et: {e}"))
+        })?;
+        let close_secs = parse_hhmm(&self.market_close_et).map_err(|e| {
+            ProcessorError::config(format!("market_close_et: {e}"))
+        })?;
+        if close_secs <= open_secs {
+            return Err(ProcessorError::config(format!(
+                "market_close_et ('{}' = {}s) must be after market_open_et ('{}' = {}s)",
+                self.market_close_et, close_secs,
+                self.market_open_et, open_secs,
+            )));
+        }
         Ok(())
+    }
+
+    /// Parsed market open time as seconds since midnight ET.
+    pub fn open_et_seconds(&self) -> u32 {
+        parse_hhmm(&self.market_open_et).expect("validate() must be called first")
+    }
+
+    /// Parsed market close time as seconds since midnight ET.
+    pub fn close_et_seconds(&self) -> u32 {
+        parse_hhmm(&self.market_close_et).expect("validate() must be called first")
     }
 }
 
-fn default_strategy() -> String { "time_based".to_string() }
+/// Parse "HH:MM" or "H:MM" into seconds since midnight.
+///
+/// Accepts 24-hour format. Valid range: 00:00 (0) to 23:59 (86340).
+pub(crate) fn parse_hhmm(s: &str) -> std::result::Result<u32, String> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return Err(format!("'{}' is not HH:MM format", s));
+    }
+    let hours: u32 = parts[0].parse().map_err(|_| format!("invalid hours in '{}'", s))?;
+    let minutes: u32 = parts[1].parse().map_err(|_| format!("invalid minutes in '{}'", s))?;
+    if hours >= 24 {
+        return Err(format!("hours ({}) must be < 24 in '{}'", hours, s));
+    }
+    if minutes >= 60 {
+        return Err(format!("minutes ({}) must be < 60 in '{}'", minutes, s));
+    }
+    Ok(hours * 3600 + minutes * 60)
+}
+
 fn default_bin_size() -> u32 { 60 }
 fn default_market_open() -> String { "09:30".to_string() }
 fn default_market_close() -> String { "16:00".to_string() }
@@ -331,6 +395,21 @@ fn default_bucket_volume() -> u64 { 5000 }
 fn default_lookback() -> usize { 50 }
 fn default_sigma_window() -> u32 { 1 }
 
+/// Empty bin policy for bins with no TRF trades.
+///
+/// NOTE: Only `ForwardFillState` is currently implemented in `features/mod.rs`.
+/// `ZeroAll` and `NanAll` are accepted by config parsing but the feature
+/// extraction always runs the forward-fill path. Implementing the other
+/// policies is deferred — this enum makes the dead-config status explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmptyBinPolicy {
+    #[default]
+    ForwardFillState,
+    ZeroAll,
+    NanAll,
+}
+
 /// Validation and gating configuration.
 ///
 /// Source: docs/design/05_CONFIGURATION_SCHEMA.md [validation]
@@ -352,10 +431,10 @@ pub struct ValidationConfig {
     /// TRF trades per 1-second window to trigger burst. Default: 20.
     #[serde(default = "default_burst_threshold")]
     pub burst_threshold: u32,
-    /// Empty bin policy. Default: "forward_fill_state".
-    /// Valid: "forward_fill_state", "zero_all", "nan_all".
-    #[serde(default = "default_empty_bin_policy")]
-    pub empty_bin_policy: String,
+    /// Empty bin policy. Default: forward_fill_state.
+    /// NOTE: Only ForwardFillState is implemented. See `EmptyBinPolicy` doc.
+    #[serde(default)]
+    pub empty_bin_policy: EmptyBinPolicy,
     /// Enable half-day auto-detection. Default: true.
     /// When enabled, consecutive empty bins trigger early session close.
     #[serde(default = "default_true")]
@@ -364,7 +443,6 @@ pub struct ValidationConfig {
     /// At 60s bins, 10 = 10 minutes. Avoids LULD halt false positives.
     #[serde(default = "default_close_gap")]
     pub close_detection_gap_bins: u32,
-    // NOTE: [publishers] config deferred — using PublisherClass::from_id() for now.
 }
 
 impl Default for ValidationConfig {
@@ -375,7 +453,7 @@ impl Default for ValidationConfig {
             warmup_bins: default_warmup(),
             block_threshold: default_block_threshold(),
             burst_threshold: default_burst_threshold(),
-            empty_bin_policy: default_empty_bin_policy(),
+            empty_bin_policy: EmptyBinPolicy::default(),
             auto_detect_close: true,
             close_detection_gap_bins: default_close_gap(),
         }
@@ -399,13 +477,6 @@ impl ValidationConfig {
             return Err(ProcessorError::config(
                 "block_threshold must be > 0",
             ));
-        }
-        let valid_policies = ["forward_fill_state", "zero_all", "nan_all"];
-        if !valid_policies.contains(&self.empty_bin_policy.as_str()) {
-            return Err(ProcessorError::config(format!(
-                "empty_bin_policy '{}' must be one of {:?}",
-                self.empty_bin_policy, valid_policies
-            )));
         }
         if self.close_detection_gap_bins == 0 {
             return Err(ProcessorError::config(
@@ -730,7 +801,6 @@ fn default_staleness() -> u64 { 5_000_000_000 } // 5 seconds
 fn default_warmup() -> u32 { 3 }
 fn default_block_threshold() -> u32 { 10_000 }
 fn default_burst_threshold() -> u32 { 20 }
-fn default_empty_bin_policy() -> String { "forward_fill_state".to_string() }
 fn default_close_gap() -> u32 { 10 }
 
 #[cfg(test)]
@@ -772,12 +842,10 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_strategy_rejected() {
-        let config = SamplingConfig {
-            strategy: "volume_based".to_string(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
+    fn test_unknown_strategy_rejected_by_serde() {
+        let toml_str = r#"strategy = "volume_based""#;
+        let result: std::result::Result<SamplingConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "Unknown strategy must fail at deserialization");
     }
 
     #[test]
@@ -825,12 +893,10 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_empty_bin_policy() {
-        let config = ValidationConfig {
-            empty_bin_policy: "invalid".to_string(),
-            ..Default::default()
-        };
-        assert!(config.validate().is_err());
+    fn test_invalid_empty_bin_policy_rejected_by_serde() {
+        let toml_str = r#"empty_bin_policy = "invalid""#;
+        let result: std::result::Result<ValidationConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "Unknown empty_bin_policy must fail at deserialization");
     }
 
     #[test]
@@ -854,7 +920,7 @@ mod tests {
         "#;
         let config: SamplingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.bin_size_seconds, 30);
-        assert_eq!(config.strategy, "time_based"); // default
+        assert_eq!(config.strategy, SamplingStrategy::TimeBased); // default
         assert!(config.validate().is_ok());
     }
 
@@ -970,7 +1036,7 @@ mod tests {
         assert_eq!(v.warmup_bins, 3);
         assert_eq!(v.block_threshold, 10_000);
         assert_eq!(v.burst_threshold, 20);
-        assert_eq!(v.empty_bin_policy, "forward_fill_state");
+        assert_eq!(v.empty_bin_policy, EmptyBinPolicy::ForwardFillState);
 
         let vp = VpinConfig::default();
         assert_eq!(vp.bucket_volume, 5000);
@@ -1313,6 +1379,25 @@ mod tests {
         assert_eq!(
             via_helper, via_direct,
             "to_canonical_toml must be byte-identical to toml::to_string output"
+        );
+    }
+
+    // ── Golden hash regression test (CODEBASE.md Roadmap #13) ──────────
+
+    #[test]
+    fn test_config_hash_golden_regression() {
+        // Frozen golden hash for the sample_processor_config() fixture.
+        // If this test fails, a serialization-breaking change was introduced.
+        // Regenerate ONLY after confirming the change is intentional and all
+        // existing exports have been accounted for.
+        let config = sample_processor_config();
+        let hash = config.config_hash_hex().expect("hash");
+        let golden = "c142f46663ae401bd9ae3250b3f7e9d3047b09db425d19050aecfdbb22ea11fa";
+        assert_eq!(
+            hash, golden,
+            "Config hash changed! This breaks provenance for existing exports. \
+             If intentional, update the golden hash after verifying no stored \
+             hashes are invalidated."
         );
     }
 

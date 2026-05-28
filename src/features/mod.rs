@@ -100,7 +100,7 @@ impl FeatureExtractor {
         boundary: &BinBoundary,
         output: &mut Vec<f64>,
     ) {
-        debug_assert!(
+        assert!(
             self.session_duration_ns > 0,
             "FeatureExtractor::init_day() must be called before extract()"
         );
@@ -161,18 +161,18 @@ impl FeatureExtractor {
             "Non-finite feature value detected at bin {}",
             boundary.bin_index
         );
-        debug_assert!(
+        assert!(
             output[BIN_VALID] == 0.0 || output[BIN_VALID] == 1.0,
             "bin_valid must be 0.0 or 1.0, got {}",
             output[BIN_VALID]
         );
-        debug_assert!(
+        assert!(
             output[BBO_VALID] == 0.0 || output[BBO_VALID] == 1.0,
             "bbo_valid must be 0.0 or 1.0, got {}",
             output[BBO_VALID]
         );
-        debug_assert_eq!(output[SCHEMA_VERSION_IDX], SCHEMA_VERSION);
-        debug_assert!(
+        assert_eq!(output[SCHEMA_VERSION_IDX], SCHEMA_VERSION);
+        assert!(
             output[SESSION_PROGRESS] >= 0.0 && output[SESSION_PROGRESS] <= 1.0,
             "session_progress out of [0,1]: {}",
             output[SESSION_PROGRESS]

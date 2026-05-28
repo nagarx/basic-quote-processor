@@ -55,7 +55,11 @@ fn process_day(
     );
 
     // Per-day initialization
-    sampler.init_day(year, month, day);
+    sampler.init_day(
+        year, month, day,
+        sampling_config.open_et_seconds(),
+        sampling_config.close_et_seconds(),
+    );
     accumulator.set_bin_size_ns(sampler.bin_size_ns());
     extractor.init_day(
         sampler.utc_offset_hours(),

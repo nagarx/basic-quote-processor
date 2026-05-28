@@ -34,13 +34,13 @@ pub const UNDEF_PRICE: i64 = i64::MAX;
 
 /// Off-exchange feature schema version.
 /// Emitted at feature index 33 in every feature vector.
-/// Independent of MBO pipeline schema version (2.2).
+/// Independent of MBO pipeline schema version (3.0).
 ///
 /// Source: docs/design/04_FEATURE_SPECIFICATION.md
 pub const SCHEMA_VERSION: f64 = 1.0;
 
 /// Off-exchange contract version string.
-/// Independent of MBO pipeline contract version (2.2).
+/// Independent of MBO pipeline contract version (3.0).
 ///
 /// Source: docs/design/04_FEATURE_SPECIFICATION.md
 pub const CONTRACT_VERSION: &str = "off_exchange_1.0";
