@@ -26,11 +26,13 @@ use self::stats_accumulator::StatsAccumulator;
 
 use hft_statistics::statistics::VpinComputer;
 
+use serde::Serialize;
+
 /// Per-day diagnostic summary for metadata JSON.
 ///
 /// Must be read via `day_summary()` BEFORE `reset_day()`, following the
 /// pattern established by `BboState::crossed_count()` / `reset_counters()`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DaySummary {
     pub total_records_processed: u64,
     pub total_bins_emitted: u64,

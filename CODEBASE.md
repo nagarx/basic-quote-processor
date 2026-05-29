@@ -2,7 +2,7 @@
 
 Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
-**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (475 tests: 412 lib + 63 integration)
+**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (481 tests: 418 lib + 63 integration)
 **Schema**: off_exchange 1.0 (independent of MBO schema 3.0)
 **Features**: 34 (indices 0-33), 10 groups
 **Labels**: Point-return only (no smoothed), 8 horizons [1,2,3,5,10,20,30,60]
@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 475 tests
-cargo test --lib               # Run 412 lib tests only
+cargo test                     # Run all 481 tests
+cargo test --lib               # Run 418 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -134,6 +134,9 @@ Categorical (non-normalizable): [29, 30, 32, 33]
 | `{day}_forward_prices.npy` | [N, 61] | float64 | USD |
 | `{day}_metadata.json` | — | JSON | all spec fields |
 | `{day}_normalization.json` | — | JSON | per-feature stats |
+| `{day}_diagnostics.json` | — | JSON | per-day health counters (`DaySummary`); `schema_version` 1.0.0 |
+
+The multi-day `dataset_manifest.json` additionally carries `diagnostics_files` — a list of `<split>/<day>_diagnostics.json` relative paths aggregating the per-day sidecars. Per-day `{day}_metadata.json` now also includes `provenance.git_commit` / `provenance.git_dirty` (captured at build time).
 
 ---
 
@@ -183,7 +186,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (412 total)
+## Test Inventory (418 total)
 
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -198,7 +201,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | features/*.rs | 18 | All 34 formulas, indices, classification |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
 | labeling/*.rs | 22 | Point-return, forward prices, golden tests |
-| export/*.rs | 36 | NPY shapes, normalization, metadata, manifest |
+| export/*.rs | 42 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar |
 | pipeline.rs | 11 | Finalize, alignment, determinism |
 | context.rs | 11 | EQUS loading, fallback, date lookup |
 | dates.rs | 12 | Weekday enum, split, date parsing |
@@ -249,7 +252,7 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.
 10. **Integration test gating** — **RESOLVED in this commit (PARTIAL)** — all 5 integration test files (`classifier_test`, `integration_test`, `phase3_test`, `phase4_test`, `phase5_test`) now panic if data is missing AND `CI` env var is set, preserving local-dev silent-skip behavior otherwise. Same pattern applied to `equs_available()` in phase5_test. Note: a few orphan path-checks (e.g., `test_discover_files`, second-day path in `classifier_test::test_no_state_leakage_between_days`) bypass `data_available()` and remain silent-skip — fix in a follow-up.
 11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback.
-12. **`git_commit` / `git_dirty` provenance via `build.rs`** — currently metadata emits `processor_version` (from `env!("CARGO_PKG_VERSION")`) but no git commit hash. Phase 10 will add a `build.rs` script that shells to `git rev-parse HEAD` at compile time and exposes via `env!("GIT_COMMIT")`.
+12. **`git_commit` / `git_dirty` provenance via `build.rs`** — **RESOLVED (2026-05-29)** — `build.rs` shells to `git rev-parse HEAD` + `git diff --quiet HEAD` at compile time, exposing `GIT_COMMIT_HASH`/`GIT_DIRTY` rustc-env vars consumed via `option_env!` in `ProvenanceMeta` (`src/export/metadata.rs`), which now emits `git_commit` + `git_dirty` ("unknown"/false fallback). Mirrors the MBO extractor `build.rs`. Crate version also bumped `0.1.0` → `0.9.0` so `processor_version` is a meaningful staleness signal.
 13. **Frozen golden-hash regression test** — **RESOLVED in commit 8e46608 (2026-05-28)** — `test_config_hash_golden_regression` in `src/config.rs` pins SHA-256 `c142f46663ae401bd9ae3250b3f7e9d3047b09db425d19050aecfdbb22ea11fa` for the `sample_processor_config()` fixture; detects drift from serde_derive, toml minor version bumps, or accidental struct-field reordering.
 14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+).
 15. **`validate_off_exchange_export_contract`** (Python consumer) does not yet validate the `forward_prices` block presence/shape — add in `hft-contracts` alongside Phase 10.

@@ -39,6 +39,11 @@ pub struct DatasetManifest {
     pub processor_version: String,
     /// False during export, true on successful completion.
     pub complete: bool,
+    /// Relative paths (from the export root) of per-day `{day}_diagnostics.json`
+    /// sidecars, in export order. `#[serde(default)]` keeps pre-existing
+    /// manifests (written before this field existed) deserializable.
+    #[serde(default)]
+    pub diagnostics_files: Vec<String>,
     pub splits: SplitsInfo,
 }
 
@@ -132,6 +137,7 @@ impl DatasetManifest {
             config_hash: String::new(),
             processor_version: env!("CARGO_PKG_VERSION").to_string(),
             complete: false,
+            diagnostics_files: Vec::new(),
             splits: SplitsInfo {
                 train: SplitDetail::empty(),
                 val: SplitDetail::empty(),
@@ -226,7 +232,7 @@ mod tests {
             "days_processed", "total_sequences", "sequence_length",
             "stride", "bin_size_seconds", "labeling_strategy",
             "horizons", "normalization", "export_timestamp",
-            "processor_version", "complete", "splits",
+            "processor_version", "complete", "diagnostics_files", "splits",
         ] {
             assert!(parsed.get(field).is_some(), "Missing field: {}", field);
         }
@@ -332,5 +338,28 @@ mod tests {
         let parsed: DatasetManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.experiment, manifest.experiment);
         assert_eq!(parsed.feature_count, manifest.feature_count);
+    }
+
+    #[test]
+    fn test_manifest_diagnostics_files_aggregate() {
+        let mut manifest = test_manifest();
+        assert!(manifest.diagnostics_files.is_empty(), "starts empty");
+        manifest.diagnostics_files.push("train/2025-02-03_diagnostics.json".to_string());
+        manifest.diagnostics_files.push("test/2025-11-14_diagnostics.json".to_string());
+        let json = manifest.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["diagnostics_files"][0], "train/2025-02-03_diagnostics.json");
+        assert_eq!(parsed["diagnostics_files"][1], "test/2025-11-14_diagnostics.json");
+    }
+
+    #[test]
+    fn test_manifest_diagnostics_files_backward_compat() {
+        // A manifest written before `diagnostics_files` existed (field absent)
+        // must still deserialize, defaulting to an empty vec via serde(default).
+        let mut value = serde_json::to_value(test_manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("diagnostics_files");
+        let json = serde_json::to_string(&value).unwrap();
+        let parsed: DatasetManifest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.diagnostics_files.is_empty());
     }
 }

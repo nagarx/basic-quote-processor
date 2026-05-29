@@ -148,6 +148,14 @@ pub struct NormalizationMeta {
 pub struct ProvenanceMeta {
     pub source_file: String,
     pub processor_version: String,
+    /// Git commit hash of the build that produced this export, or "unknown"
+    /// if git was unavailable at build time. Captured by build.rs. This is the
+    /// authoritative staleness signal — `processor_version` alone cannot
+    /// distinguish two builds at the same crate version.
+    pub git_commit: String,
+    /// Whether the build tree had uncommitted tracked-file changes
+    /// (`git diff --quiet HEAD`). Captured by build.rs.
+    pub git_dirty: bool,
     pub export_timestamp_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_hash: Option<String>,
@@ -339,6 +347,11 @@ impl ExportMetadataBuilder {
             provenance: ProvenanceMeta {
                 source_file: self.provenance_source_file.unwrap_or_default(),
                 processor_version: env!("CARGO_PKG_VERSION").to_string(),
+                // Captured at compile time by build.rs. `option_env!` returns
+                // None if build.rs did not run (e.g. some IDE check paths);
+                // fall back to "unknown"/false to match the MBO extractor.
+                git_commit: option_env!("GIT_COMMIT_HASH").unwrap_or("unknown").to_string(),
+                git_dirty: option_env!("GIT_DIRTY").map(|v| v == "true").unwrap_or(false),
                 export_timestamp_utc: export_timestamp.clone(),
                 config_hash: self.config_hash,
             },
@@ -480,6 +493,24 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["day"], "2025-02-03");
+    }
+
+    #[test]
+    fn test_provenance_has_git_fields() {
+        // G2: provenance must carry git_commit (string) + git_dirty (bool),
+        // captured by build.rs. Assert presence/type only — exact values vary
+        // by build (and `option_env!` falls back to "unknown"/false if build.rs
+        // did not run), so value assertions would be brittle.
+        let meta = minimal_metadata();
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let prov = &parsed["provenance"];
+        assert!(prov["git_commit"].is_string(), "git_commit must be a string");
+        assert!(prov["git_dirty"].is_boolean(), "git_dirty must be a bool");
+        assert!(
+            !prov["git_commit"].as_str().unwrap().is_empty(),
+            "git_commit must be non-empty (\"unknown\" fallback at minimum)"
+        );
     }
 
     // ── Phase 9.1: forward_prices metadata block tests ─────────────────

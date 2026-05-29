@@ -583,6 +583,7 @@ impl DayPipeline {
             metadata,
             normalizer: self.normalizer.clone(),
             normalization_json: norm_json,
+            day_summary: summary,
         })
     }
 

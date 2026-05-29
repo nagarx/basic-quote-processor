@@ -25,7 +25,7 @@ Key capabilities:
 # Build
 cargo build --release
 
-# Run all tests (412 lib + 63 integration)
+# Run all tests (418 lib + 63 integration)
 cargo test
 
 # Lint
@@ -68,7 +68,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
                     dates.rs --> weekday enumeration, split assignment
 ```
 
-13 modules, 41 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 6 integration test files, **475 tests** (412 lib + 63 integration).
+13 modules, 41 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 6 integration test files, **481 tests** (418 lib + 63 integration).
 
 ## Feature Groups (34 total, indices 0-33)
 
@@ -96,6 +96,9 @@ Categorical (non-normalizable): [29, 30, 32, 33]. See `docs/design/04_FEATURE_SP
 | `{day}_forward_prices.npy` | [N, 61] | float64 | USD |
 | `{day}_metadata.json` | -- | JSON | all spec fields |
 | `{day}_normalization.json` | -- | JSON | per-feature stats |
+| `{day}_diagnostics.json` | -- | JSON | per-day health counters (`DaySummary`); `schema_version` 1.0.0 |
+
+The multi-day `dataset_manifest.json` carries `diagnostics_files` (relative `<split>/<day>_diagnostics.json` paths). Per-day `{day}_metadata.json` includes `provenance.git_commit` / `provenance.git_dirty` (captured at build time via `build.rs`).
 
 ## Configuration
 
@@ -146,7 +149,7 @@ OHLCV-1D consolidated daily summary. Used for coverage validation and context fe
 
 ## Testing
 
-475 tests total: 412 library unit tests + 63 integration tests.
+481 tests total: 418 library unit tests + 63 integration tests.
 
 Integration tests require Databento XNAS.BASIC CMBP-1 data files. All integration tests are gated by `data_available()` and skip gracefully when data is not present — `cargo test` will always succeed on a fresh clone, but integration tests will report as passed (skipped) rather than ignored.
 

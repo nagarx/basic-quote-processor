@@ -10,13 +10,16 @@ pub mod normalization;
 pub mod npy_writer;
 pub mod metadata;
 pub mod manifest;
+pub mod diagnostics;
 
 pub use normalization::NormalizationComputer;
 pub use metadata::ExportMetadata;
 pub use manifest::DatasetManifest;
+pub use diagnostics::{DiagnosticsSidecar, BASIC_DIAGNOSTICS_SCHEMA_VERSION};
 
 use std::path::{Path, PathBuf};
 
+use crate::accumulator::DaySummary;
 use crate::config::ExportConfig;
 use crate::contract::TOTAL_FEATURES;
 use crate::error::{ProcessorError, Result};
@@ -40,6 +43,8 @@ pub struct DayExport {
     pub normalizer: NormalizationComputer,
     /// Pre-serialized normalization JSON.
     pub normalization_json: String,
+    /// Per-day health counters, persisted as `{day}_diagnostics.json`.
+    pub day_summary: DaySummary,
 }
 
 /// Writes all export files for a single day with atomic semantics.
@@ -54,6 +59,7 @@ pub struct DayExport {
 /// - `{day}_forward_prices.npy` — `[N, max_H+1]` float64 (USD)
 /// - `{day}_metadata.json` — complete metadata
 /// - `{day}_normalization.json` — per-feature stats
+/// - `{day}_diagnostics.json` — per-day health counters (`DaySummary`)
 pub struct DayExporter {
     output_dir: PathBuf,
     apply_normalization: bool,
@@ -118,7 +124,7 @@ impl DayExporter {
             None
         };
 
-        // Write all 5 files to temp dir
+        // Write all 6 files to temp dir
         let write_result = self.write_all_files(&tmp_dir, day, export, normalizer, n_horizons, n_fwd_cols);
 
         if let Err(e) = write_result {
@@ -188,6 +194,15 @@ impl DayExporter {
             &export.normalization_json,
         ).map_err(|e| ProcessorError::export(format!("Failed to write normalization JSON: {e}")))?;
 
+        // Per-day diagnostics sidecar (health counters). Written into the temp
+        // dir, so it is moved atomically with the other files by the rename
+        // envelope in `export_day` (no separate atomic-write helper needed).
+        let diagnostics_json = DiagnosticsSidecar::new(day, &export.day_summary).to_json()?;
+        std::fs::write(
+            tmp_dir.join(format!("{day}_diagnostics.json")),
+            &diagnostics_json,
+        ).map_err(|e| ProcessorError::export(format!("Failed to write diagnostics JSON: {e}")))?;
+
         Ok(())
     }
 
@@ -248,6 +263,7 @@ mod tests {
             metadata,
             normalizer,
             normalization_json: norm_json,
+            day_summary: DaySummary::default(),
         }
     }
 
@@ -276,6 +292,7 @@ mod tests {
             "2025-02-03_forward_prices.npy",
             "2025-02-03_metadata.json",
             "2025-02-03_normalization.json",
+            "2025-02-03_diagnostics.json",
         ];
         for fname in &files {
             assert!(
@@ -317,5 +334,25 @@ mod tests {
         // Verify naming convention
         assert!(dir.path().join("2025-06-15_sequences.npy").exists());
         assert!(dir.path().join("2025-06-15_metadata.json").exists());
+    }
+
+    #[test]
+    fn test_day_exporter_writes_diagnostics_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let exporter = DayExporter::from_dir(dir.path(), false).unwrap();
+        let export = make_test_export("2025-02-03", 4);
+        exporter.export_day(&export).unwrap();
+
+        let path = dir.path().join("2025-02-03_diagnostics.json");
+        assert!(path.exists(), "diagnostics sidecar not written");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(parsed["schema_version"], BASIC_DIAGNOSTICS_SCHEMA_VERSION);
+        assert_eq!(parsed["day"], "2025-02-03");
+        assert!(parsed["summary"].is_object(), "summary block missing");
+        assert!(
+            parsed["summary"].get("total_bins_emitted").is_some(),
+            "summary should expose DaySummary counters"
+        );
     }
 }

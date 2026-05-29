@@ -105,13 +105,14 @@ fn test_full_day_export() {
     let n = exporter.export_day(&export).unwrap();
     assert!(n > 0, "Should have exported sequences");
 
-    // Verify all 5 files exist
+    // Verify all 6 files exist
     let files = [
         "2025-02-03_sequences.npy",
         "2025-02-03_labels.npy",
         "2025-02-03_forward_prices.npy",
         "2025-02-03_metadata.json",
         "2025-02-03_normalization.json",
+        "2025-02-03_diagnostics.json",
     ];
     for fname in &files {
         assert!(

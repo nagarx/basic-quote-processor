@@ -188,6 +188,15 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
                 };
                 split_detail.record_day(&iso_str, exported);
 
+                // G3: aggregate the per-day diagnostics sidecar path. Only when
+                // sequences were actually written — export_day writes nothing
+                // (including no sidecar) for a 0-sequence day.
+                if exported > 0 {
+                    manifest
+                        .diagnostics_files
+                        .push(format!("{}/{}_diagnostics.json", split, iso_str));
+                }
+
                 let elapsed = timer.elapsed();
                 eprintln!(
                     "[{:>3}/{}] {} {:>4} sequences ({}), {:.1}s",
