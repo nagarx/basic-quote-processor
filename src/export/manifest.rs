@@ -44,6 +44,16 @@ pub struct DatasetManifest {
     /// manifests (written before this field existed) deserializable.
     #[serde(default)]
     pub diagnostics_files: Vec<String>,
+    /// ISO dates (`YYYY-MM-DD`) of days that streamed successfully but produced
+    /// ZERO sequences (e.g. a half-session, or every label NaN-truncated).
+    /// These are ALSO present in `splits.*.days[]` (counts unchanged) — this
+    /// list is an explicit annotation so consumers can distinguish a populated
+    /// day from a silently-empty one without inferring it from an absent
+    /// `diagnostics_files` entry. Does NOT flip `complete` (an empty day is an
+    /// observation, not a failure). `#[serde(default)]` keeps pre-existing
+    /// manifests deserializable.
+    #[serde(default)]
+    pub zero_sequence_days: Vec<String>,
     pub splits: SplitsInfo,
 }
 
@@ -138,6 +148,7 @@ impl DatasetManifest {
             processor_version: env!("CARGO_PKG_VERSION").to_string(),
             complete: false,
             diagnostics_files: Vec::new(),
+            zero_sequence_days: Vec::new(),
             splits: SplitsInfo {
                 train: SplitDetail::empty(),
                 val: SplitDetail::empty(),
@@ -232,7 +243,8 @@ mod tests {
             "days_processed", "total_sequences", "sequence_length",
             "stride", "bin_size_seconds", "labeling_strategy",
             "horizons", "normalization", "export_timestamp",
-            "processor_version", "complete", "diagnostics_files", "splits",
+            "processor_version", "complete", "diagnostics_files",
+            "zero_sequence_days", "splits",
         ] {
             assert!(parsed.get(field).is_some(), "Missing field: {}", field);
         }
@@ -361,5 +373,26 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         let parsed: DatasetManifest = serde_json::from_str(&json).unwrap();
         assert!(parsed.diagnostics_files.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_zero_sequence_days_aggregate() {
+        let mut manifest = test_manifest();
+        assert!(manifest.zero_sequence_days.is_empty(), "starts empty");
+        manifest.zero_sequence_days.push("2025-07-03".to_string());
+        let json = manifest.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["zero_sequence_days"][0], "2025-07-03");
+    }
+
+    #[test]
+    fn test_manifest_zero_sequence_days_backward_compat() {
+        // A manifest written before `zero_sequence_days` existed (field absent)
+        // must still deserialize, defaulting to an empty vec via serde(default).
+        let mut value = serde_json::to_value(test_manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("zero_sequence_days");
+        let json = serde_json::to_string(&value).unwrap();
+        let parsed: DatasetManifest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.zero_sequence_days.is_empty());
     }
 }

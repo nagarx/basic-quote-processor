@@ -665,9 +665,12 @@ Each `{day}_metadata.json` must contain the following fields. These mirror the M
     },
     "provenance": {
         "source_file": "xnas-basic-20250203.cmbp-1.dbn.zst",
-        "processor_version": "0.1.0",
+        "processor_version": "0.9.0",
+        "git_commit": "a1b2c3d4e5f6...40charhex...",
+        "git_dirty": false,
         "export_timestamp_utc": "2026-03-22T15:30:00Z",
-        "config_hash": "e1b2c3d4e5f60708...64charhex..."
+        "config_hash": "e1b2c3d4e5f60708...64charhex...",
+        "data_file_sha256": "9f86d081884c7d65...64charhex..."
     },
     "export_timestamp": "2026-03-22T15:30:00Z",
     "horizons": [1, 2, 3, 5, 10, 20, 30, 60],
@@ -733,7 +736,7 @@ Each `{day}_metadata.json` must contain the following fields. These mirror the M
 | `label_strategy` | string | Always `"point_return"` for this module |
 | `label_encoding` | string | Always `"continuous_bps"` |
 | `normalization` | object | Strategy, applied flag, params file path |
-| `provenance` | object | Extractor, version, git, config hash, timestamps |
+| `provenance` | object | source_file, processor_version, git_commit/git_dirty, config_hash, data_file_sha256 (SHA-256 of raw input .dbn.zst), timestamps |
 | `export_timestamp` | string | ISO 8601 UTC timestamp |
 | `bin_size_seconds` | int | Time bin size for alignment validation |
 | `market_open_et` | string | Market open time (ET) for alignment validation |
@@ -883,6 +886,8 @@ The `dataset_manifest.json` at the root of the export directory describes the fu
     "mean_valid_bins_per_day": 383
 }
 ```
+
+> **Note**: the JSON above is illustrative and has partially drifted from the code. Several fields shown (e.g. `feature_groups_enabled`, `classification_config`, `market_open_et`, `total_trf_trades`) are emitted in the per-day `{day}_metadata.json`, **not** the manifest. The authoritative manifest schema is the `DatasetManifest` struct in `src/export/manifest.rs`. Observability fields (both `#[serde(default)]`): `diagnostics_files` (per-day sidecar paths) and `zero_sequence_days` (ISO dates that streamed OK but produced 0 sequences; also present in `splits.*.days[]`).
 
 **Required fields** (subset that must always be present, matching MBO manifest contract plus off-exchange additions):
 

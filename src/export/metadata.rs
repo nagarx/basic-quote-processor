@@ -159,6 +159,12 @@ pub struct ProvenanceMeta {
     pub export_timestamp_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_hash: Option<String>,
+    /// SHA-256 (lowercase hex) of the RAW input `.dbn.zst` that produced this
+    /// day's export (see [`crate::hash::sha256_file`]). Detects a Databento
+    /// re-issue — same `source_file` path, different content — that the
+    /// basename-only `source_file` cannot. Per-day; omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_file_sha256: Option<String>,
 }
 
 impl ExportMetadata {
@@ -210,6 +216,7 @@ pub struct ExportMetadataBuilder {
     signing_method: Option<String>,
     exclusion_band: f64,
     config_hash: Option<String>,
+    data_file_sha256: Option<String>,
     forward_prices: Option<ForwardPricesMeta>,
     experiment: Option<String>,
 }
@@ -247,6 +254,7 @@ impl ExportMetadataBuilder {
             signing_method: None,
             exclusion_band: 0.10,
             config_hash: None,
+            data_file_sha256: None,
             forward_prices: None,
             experiment: None,
         }
@@ -290,6 +298,8 @@ impl ExportMetadataBuilder {
     pub fn signing_method(mut self, m: &str) -> Self { self.signing_method = Some(m.to_string()); self }
     pub fn exclusion_band(mut self, b: f64) -> Self { self.exclusion_band = b; self }
     pub fn config_hash(mut self, h: &str) -> Self { self.config_hash = Some(h.to_string()); self }
+    /// Attach the SHA-256 of the raw input `.dbn.zst` (forensic provenance, #28).
+    pub fn data_file_sha256(mut self, h: &str) -> Self { self.data_file_sha256 = Some(h.to_string()); self }
     /// Phase 9.4 / D13: Attach experiment identifier.
     pub fn experiment(mut self, e: &str) -> Self { self.experiment = Some(e.to_string()); self }
 
@@ -354,6 +364,7 @@ impl ExportMetadataBuilder {
                 git_dirty: option_env!("GIT_DIRTY").map(|v| v == "true").unwrap_or(false),
                 export_timestamp_utc: export_timestamp.clone(),
                 config_hash: self.config_hash,
+                data_file_sha256: self.data_file_sha256,
             },
             export_timestamp,
             first_bin_start_ns: self.first_bin_start_ns,
@@ -511,6 +522,38 @@ mod tests {
             !prov["git_commit"].as_str().unwrap().is_empty(),
             "git_commit must be non-empty (\"unknown\" fallback at minimum)"
         );
+    }
+
+    #[test]
+    fn test_provenance_data_file_sha256_omitted_when_unset() {
+        // #28: an export whose builder never set the input-file hash must OMIT
+        // the key (skip_serializing_if), not emit null — keeps the open-schema
+        // downstream consumer additive-safe.
+        let meta = minimal_metadata();
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["provenance"].get("data_file_sha256").is_none(),
+            "data_file_sha256 must be omitted when unset"
+        );
+    }
+
+    #[test]
+    fn test_provenance_data_file_sha256_present_when_set() {
+        // #28: when set, the 64-hex input hash appears under provenance.
+        let sha = "a".repeat(64);
+        let meta = ExportMetadata::builder()
+            .day("2025-02-03")
+            .n_sequences(100)
+            .window_size(20)
+            .horizons(vec![1])
+            .bin_size_seconds(60)
+            .data_file_sha256(&sha)
+            .build()
+            .unwrap();
+        let json = meta.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["provenance"]["data_file_sha256"], sha);
     }
 
     // ── Phase 9.1: forward_prices metadata block tests ─────────────────

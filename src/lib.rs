@@ -37,6 +37,7 @@
 
 pub mod error;
 pub mod contract;
+pub mod hash;
 pub mod reader;
 pub mod bbo_state;
 pub mod trade_classifier;
@@ -53,6 +54,7 @@ pub mod dates;
 
 // Phase 1-2 re-exports
 pub use error::{ProcessorError, Result};
+pub use hash::sha256_file;
 pub use reader::{CmbpRecord, DbnReader, PublisherClass};
 pub use bbo_state::BboState;
 pub use trade_classifier::{

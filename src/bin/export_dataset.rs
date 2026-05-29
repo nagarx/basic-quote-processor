@@ -161,12 +161,34 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
         // F1 — set the source file basename for this day's metadata provenance.
         // Basename (not full path) keeps metadata portable across machines; the
         // full path embeds user-specific filesystem layout.
-        let source_basename = file_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        // P5 (#23): surface the previously-silent fallback. A discovered file
+        // should always have a UTF-8 basename; warn loudly if not (otherwise the
+        // metadata silently carries an empty `source_file` with no diagnostic).
+        let source_basename = match file_path.file_name().and_then(|s| s.to_str()) {
+            Some(name) => name.to_string(),
+            None => {
+                log::warn!(
+                    "Could not resolve a UTF-8 basename for {}; \
+                     provenance.source_file will be empty",
+                    file_path.display()
+                );
+                String::new()
+            }
+        };
         pipeline.set_source_file(source_basename);
+
+        // #28: forensic input-content hash of the raw (compressed) `.dbn.zst`,
+        // via the crate's streaming `sha256_file` (reuses the existing `sha2`
+        // dep). On failure, warn and continue with the hash omitted — provenance
+        // enrichment must never abort a day's export.
+        match basic_quote_processor::sha256_file(&file_path) {
+            Ok(hash) => pipeline.set_data_file_sha256(hash),
+            Err(e) => log::warn!(
+                "Could not hash input {} for provenance: {e}; \
+                 provenance.data_file_sha256 will be omitted",
+                file_path.display()
+            ),
+        }
 
         // Process day
         pipeline.init_day_with_context(year, month, day, Some(context));
@@ -195,6 +217,14 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
                     manifest
                         .diagnostics_files
                         .push(format!("{}/{}_diagnostics.json", split, iso_str));
+                } else {
+                    // #24: a day that streamed OK but produced 0 sequences is
+                    // still recorded in `days[]` (counts unchanged) AND annotated
+                    // here, so consumers can distinguish an empty day from a
+                    // populated one. Does NOT flip `complete` (observation, not
+                    // failure). export_day writes no files for a 0-seq day, so
+                    // there is correctly no diagnostics sidecar to aggregate.
+                    manifest.zero_sequence_days.push(iso_str.clone());
                 }
 
                 let elapsed = timer.elapsed();
@@ -234,10 +264,23 @@ fn run(args: &Args) -> basic_quote_processor::Result<()> {
     manifest.mark_complete();
     manifest.write_to_file(&manifest_path)?;
 
-    // Copy config TOML alongside manifest
+    // Copy config TOML alongside manifest. P5 (#23): surface BOTH previously-
+    // silent failures (re-read + write) at warn! — this is a best-effort
+    // provenance sidecar, so warn-and-continue (never abort the completed export).
     let config_copy_path = output_dir.join("export_config.toml");
-    if let Ok(config_content) = std::fs::read_to_string(config_path) {
-        let _ = std::fs::write(&config_copy_path, config_content);
+    match std::fs::read_to_string(config_path) {
+        Ok(config_content) => {
+            if let Err(e) = std::fs::write(&config_copy_path, config_content) {
+                log::warn!(
+                    "Failed to write config copy to {}: {e}",
+                    config_copy_path.display()
+                );
+            }
+        }
+        Err(e) => log::warn!(
+            "Failed to re-read config {} for copy: {e}",
+            config_path.display()
+        ),
     }
 
     // Print summary

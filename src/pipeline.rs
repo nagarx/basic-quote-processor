@@ -69,6 +69,9 @@ pub struct DayPipeline {
     /// Basename of the input .dbn.zst for the current day (F1). Set per-day
     /// via `set_source_file`; cleared by `reset()`.
     source_file: Option<String>,
+    /// SHA-256 of the raw input .dbn.zst for the current day (#28). Set per-day
+    /// via `set_data_file_sha256`; cleared by `reset()` (like `source_file`).
+    data_file_sha256: Option<String>,
     /// Phase 9.5: normalization strategy string to emit in metadata. Set
     /// once via `set_normalization_strategy`; preserved across `reset()`.
     /// `None` → builder default ("none") is used.
@@ -115,6 +118,7 @@ impl DayPipeline {
             detected_close_ns: None,
             config_hash: None,
             source_file: None,
+            data_file_sha256: None,
             normalization_strategy: None,
             normalization_applied: None,
             experiment: None,
@@ -139,6 +143,16 @@ impl DayPipeline {
     /// make metadata non-portable across machines.
     pub fn set_source_file(&mut self, basename: String) {
         self.source_file = Some(basename);
+    }
+
+    /// Set the SHA-256 of the input `.dbn.zst` for metadata provenance (#28).
+    ///
+    /// Call **before** `finalize()` each day (alongside `set_source_file`).
+    /// Per-day state — cleared by `reset()` so the previous day's input hash
+    /// never leaks into this day's metadata. Compute with
+    /// [`crate::hash::sha256_file`].
+    pub fn set_data_file_sha256(&mut self, hash: String) {
+        self.data_file_sha256 = Some(hash);
     }
 
     /// Set the normalization strategy string emitted in metadata (Phase 9.5).
@@ -558,6 +572,11 @@ impl DayPipeline {
         if let Some(src) = self.source_file.as_deref() {
             builder = builder.provenance_source_file(src);
         }
+        // #28 — forensic input-content hash (per-day). Detects a Databento
+        // re-issue that the basename-only `source_file` cannot.
+        if let Some(h) = self.data_file_sha256.as_deref() {
+            builder = builder.data_file_sha256(h);
+        }
         // Phase 9.5 — emit the configured strategy, not the hardcoded
         // "per_day_zscore". If unset, metadata defaults to "none".
         if let Some(strategy) = self.normalization_strategy.as_deref() {
@@ -637,10 +656,11 @@ impl DayPipeline {
         self.consecutive_empty_bins = 0;
         self.detected_close_ns = None;
         self.bucket_volume_override = None;
-        // Phase 9.4: source_file is per-day (clear); config_hash /
-        // normalization_strategy / normalization_applied / experiment are
-        // per-run (preserve — constant across all days in a single run).
+        // Phase 9.4 / #28: source_file + data_file_sha256 are per-day (clear);
+        // config_hash / normalization_strategy / normalization_applied /
+        // experiment are per-run (preserve — constant across all days in a run).
         self.source_file = None;
+        self.data_file_sha256 = None;
     }
 
     /// Day-level diagnostic summary.
@@ -1032,6 +1052,23 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_set_data_file_sha256_cleared_on_reset() {
+        // #28 — `data_file_sha256` is per-day and MUST be cleared by `reset()`
+        // so the previous day's input hash never leaks into this day's metadata
+        // (the leak class that motivated clearing `source_file`).
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+        let h = "a".repeat(64);
+        pipeline.set_data_file_sha256(h.clone());
+        assert_eq!(pipeline.data_file_sha256.as_deref(), Some(h.as_str()));
+        pipeline.reset();
+        assert_eq!(
+            pipeline.data_file_sha256, None,
+            "data_file_sha256 must be cleared by reset() (per-day state)"
+        );
+    }
+
+    #[test]
     fn test_pipeline_finalize_emits_provenance_fields() {
         // F1, F2, 9.4 — when setters are called, `finalize()` emits those fields
         // in the metadata. Also verifies F2 populates the previously-empty
@@ -1046,6 +1083,8 @@ mod tests {
         let fake_hash: String = "c".repeat(64);
         pipeline.set_config_hash(fake_hash.clone());
         pipeline.set_source_file("xnas-basic-20250203.cmbp-1.dbn.zst".to_string());
+        let fake_sha: String = "d".repeat(64);
+        pipeline.set_data_file_sha256(fake_sha.clone());
 
         let bins: Vec<FeatureVec> = (0..6).map(|i| make_fv(i as f64)).collect();
         let mid_prices: Vec<f64> = (0..6).map(|i| 100.0 + i as f64).collect();
@@ -1064,6 +1103,12 @@ mod tests {
             export.metadata.provenance.source_file,
             "xnas-basic-20250203.cmbp-1.dbn.zst",
             "source_file must be threaded through finalize"
+        );
+        // #28 — data_file_sha256 threaded through
+        assert_eq!(
+            export.metadata.provenance.data_file_sha256.as_ref(),
+            Some(&fake_sha),
+            "data_file_sha256 must be threaded through finalize"
         );
         // F2 — populated (no longer empty `{}`)
         assert_ne!(

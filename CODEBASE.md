@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 481 tests
-cargo test --lib               # Run 418 lib tests only
+cargo test                     # Run all 490 tests
+cargo test --lib               # Run 427 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -136,7 +136,7 @@ Categorical (non-normalizable): [29, 30, 32, 33]
 | `{day}_normalization.json` | — | JSON | per-feature stats |
 | `{day}_diagnostics.json` | — | JSON | per-day health counters (`DaySummary`); `schema_version` 1.0.0 |
 
-The multi-day `dataset_manifest.json` additionally carries `diagnostics_files` — a list of `<split>/<day>_diagnostics.json` relative paths aggregating the per-day sidecars. Per-day `{day}_metadata.json` now also includes `provenance.git_commit` / `provenance.git_dirty` (captured at build time).
+The multi-day `dataset_manifest.json` additionally carries `diagnostics_files` — a list of `<split>/<day>_diagnostics.json` relative paths aggregating the per-day sidecars. Per-day `{day}_metadata.json` also includes `provenance.git_commit` / `provenance.git_dirty` (captured at build time via `build.rs`) and `provenance.data_file_sha256` (streaming SHA-256 of the raw input `.dbn.zst`, for Databento-re-issue detection; omitted if hashing fails). The manifest also carries `zero_sequence_days` (ISO dates that streamed OK but produced 0 sequences; also present in `splits.*.days[]`, an explicit empty-day annotation).
 
 ---
 
@@ -186,12 +186,13 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (418 total)
+## Test Inventory (427 lib)
 
 | File | Tests | Coverage |
 |------|-------|---------|
 | contract.rs | 9 | Constants, names, horizons |
 | error.rs | 8 | All error variants |
+| hash.rs | 4 | Streaming SHA-256 of a file (empty / known-vector / multichunk / error) |
 | reader/*.rs | 15 | Record types, publisher IDs, file discovery |
 | bbo_state/*.rs | 37 | BBO tracking, midpoint, validation, edge cases |
 | trade_classifier/*.rs | 55 | Signing, BJZZ, BVC golden values |
@@ -201,8 +202,8 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | features/*.rs | 18 | All 34 formulas, indices, classification |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
 | labeling/*.rs | 22 | Point-return, forward prices, golden tests |
-| export/*.rs | 42 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar |
-| pipeline.rs | 11 | Finalize, alignment, determinism |
+| export/*.rs | 46 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
+| pipeline.rs | 12 | Finalize, alignment, determinism, per-day provenance reset |
 | context.rs | 11 | EQUS loading, fallback, date lookup |
 | dates.rs | 12 | Weekday enum, split, date parsing |
 | **Integration** (tests/) | 47 | Real NVIDIA data, full pipeline, shapes |
@@ -284,14 +285,14 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 20. **`--skip-existing` idempotent resume** — currently `--force` re-runs ALL 233 days from scratch; a mid-run failure costs a full re-run. Read existing `dataset_manifest.json.splits.*.days[]` and skip dates already present. Saves ~12 min per config in sweep runs.
 21. **Per-day timing breakdown in metadata** — currently only wall-clock elapsed seconds in stderr. Adding `read_time_ms`, `extract_time_ms`, `write_time_ms` to `ExportMetadata` enables performance regression detection across sweep runs.
 22. **Config-drift detection on `--force`** — read existing manifest's `config_hash`, warn (or refuse without `--clean`) if it differs from the new hash. Prevents silent inconsistency when mixing partial re-runs of different configs into the same `output_dir`.
-23. **Surface silent fallbacks** — `source_basename.unwrap_or("")` and `let _ = fs::write(config_copy_path, ...)` currently swallow errors. Add `log::warn!` on empty basename or failed config copy.
-24. **Promote `Ok(0)` sequences to an explicit status** — currently `export.sequences.is_empty()` is recorded as a successful day. Consider either (a) demoting it to `record_failure` with a specific reason, or (b) adding `n_days_zero_seq` to manifest so sweep consumers can differentiate broken days from legitimately empty days.
+23. **Surface silent fallbacks** — `source_basename.unwrap_or("")` and `let _ = fs::write(config_copy_path, ...)` currently swallow errors. Add `log::warn!` on empty basename or failed config copy. **RESOLVED (2026-05-30)**: `export_dataset.rs` now warns on a non-UTF8/empty `source_basename` and on BOTH the config-copy re-read AND write failures; warn-and-continue (never aborts the export).
+24. **Promote `Ok(0)` sequences to an explicit status** — currently `export.sequences.is_empty()` is recorded as a successful day. Consider either (a) demoting it to `record_failure` with a specific reason, or (b) adding `n_days_zero_seq` to manifest so sweep consumers can differentiate broken days from legitimately empty days. **RESOLVED (2026-05-30)**: `dataset_manifest.json.zero_sequence_days: Vec<String>` (`#[serde(default)]`) records 0-sequence days IN ADDITION to `splits.*.days[]` (counts unchanged; does NOT flip `complete` — observation, not failure).
 
 **Schema (Schema 2.0 consolidation):**
 25. **De-duplicate metadata ↔ manifest** — ~12 fields overlap with 3 naming drifts (`n_features` vs `feature_count`, `window_size` vs `sequence_length`, `label_strategy` vs `labeling_strategy`). Schema 2.0 should consolidate to a single naming convention across both files and remove redundancy (e.g., manifest keeps dataset-level facts, metadata keeps per-day facts only, manifest_ref pointer in metadata).
 26. **Remove duplicate `export_timestamp`** — metadata has both top-level `export_timestamp` and nested `provenance.export_timestamp_utc`, set to identical values. Pick one (recommend `provenance.export_timestamp_utc`).
 27. **Convert string-valued enums to Rust enums** — `schema`, `data_source`, `signing_method`, `label_encoding`, `normalization.strategy` are de-facto enums but typed as `String`. Converting to Rust enums with `#[serde(rename_all)]` gives parse-time validation.
-28. **Add `data_file_sha256` to provenance** — input file content hash enables detection of "same source_file path but different content" (databento re-issue). ~10 LOC, high forensic value. Round 8 M7.1.
+28. **Add `data_file_sha256` to provenance** — input file content hash enables detection of "same source_file path but different content" (databento re-issue). ~10 LOC, high forensic value. Round 8 M7.1. **RESOLVED (2026-05-30)**: per-day `provenance.data_file_sha256` via `crate::hash::sha256_file` (streaming SHA-256 of the raw compressed `.dbn.zst`, reusing the existing `sha2` dep — NOT `hft_statistics::io`, per the M-2 trap); cleared by `reset()`; warn-and-continue if hashing fails.
 29. **Document n_bins accounting invariant** — DONE IN ROUND 8 (doc comment added). Consider adding a `debug_assert!` in `finalize()` enforcing `n_bins_total == n_bins_valid + n_bins_label_truncated` to catch regressions.
 
 **H10 VPIN fix forward-compatibility:**
