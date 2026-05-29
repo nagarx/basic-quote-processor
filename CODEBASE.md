@@ -237,6 +237,21 @@ These were identified during a 3-agent deep audit of all 41 source files. None a
 - **H2: final partial bin drop** — **RESOLVED in Phase 9.2** — `pipeline.rs` and `tests/phase3_test.rs` final-flush condition now `has_trades() || bbo_update_count() > 0`. BBO-only bins are emitted into `feature_bins` but filtered out of sequences via `valid_mask` (all-NaN labels since no `t+h` bins exist beyond).
 - **BUG-X2: `is_empty = trf_trades == 0` at `pipeline.rs:307` excludes lit-only bins** — DEFERRED (LOW severity, diagnostic counters only; does not affect labels/sequences).
 
+### Audit Findings — Ground-Truth Verdicts (2026-05-29 re-validation)
+
+A 4-agent ground-truth re-validation (depend-on-code-not-docs) reclassified the open audit findings. **Do not re-investigate these without new evidence:**
+
+- **M-1 (BVC window grows unbounded on non-monotonic timestamps)** — **defensive-only, NOT a live bug.** `saturating_sub` skips eviction only on a backward `ts_ns`, but the real XNAS.BASIC feed produces only sub-millisecond out-of-order artifacts ("warn and accept" policy); one late trade is re-evicted by the next in-order trade (≈1 ms extra retention on a 60s window). Same "phantom boundary cluster" pattern as the MBO-LOB-reconstructor audit.
+- **L-3 (`midpoint_signer` no zero-spread guard)** — **PHANTOM.** Correctly delegated to upstream `bbo_valid` (spread > 0, finite prices); the signer returns `Unsigned` before the band math when invalid.
+- **L-4 (gap-bin warmup uses accumulator `bin_index`)** — **PHANTOM.** Sampler and accumulator `bin_index` stay in lockstep (one `reset_bin()` per gap iteration). Readability nit at most.
+- **L-8 (no `dataset_manifest.json`)** — **PHANTOM / stale finding.** `src/export/manifest.rs` already writes a full manifest (now also `diagnostics_files[]`).
+- **`EmptyBinPolicy::{ZeroAll, NanAll}` unimplemented** — **correct permanent design**, not a gap. Fail-loud-rejected per §5; implementing them is speculative. Do NOT implement absent a real experiment need.
+- **Whole-crate incompleteness sweep** — **N = 0 incomplete implementations** (no `todo!`/`unimplemented!`/unwired-config/scaffolding; the only "not yet implemented" strings are fail-loud rejections). The crate is cleanly closeable.
+
+**⚠️ Engineering trap (future atomic-write / SSoT work):** reusing `hft_statistics::io::atomic_write_json` from this crate RE-TRIGGERS the M-2 incident — it flips the local `.cargo/config.toml` `[[patch.unused]]` block active, swaps `hft-statistics` git-`0.1.0` → local `0.3.0-dev`, and drags `tempfile` into the production dep graph (Cargo.lock churn). The 2026-05-29 diagnostics sidecar therefore rides the EXISTING temp-dir+rename envelope. If true single-file manifest atomicity is ever needed, add a small LOCAL `tempfile` helper — do NOT pull `hft_statistics::io` while the local patch override exists.
+
+**Operational debt:** the live `data/exports/basic_nvda_60s/` is STALE (pre-Phase-9.4: empty `config_hash`, `processor_version` `0.1.0`). The wired traceability (`config_hash`, `git_commit`/`git_dirty`, diagnostics sidecar) only reaches the DATA after a re-export; deferred (0 configs reference it today — see Roadmap #33).
+
 ### Test Coverage Roadmap (Future Work)
 
 A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the safety net without requiring code changes:
@@ -281,6 +296,11 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 
 **H10 VPIN fix forward-compatibility:**
 30. **VPIN integration tests** — H10 regression test (Round 8) only asserts the `bucket_volume_override` field is SET correctly. When `vpin = true` is ever enabled in a production config, add an end-to-end test that confirms the first day's VPIN bucket reflects the first day's consolidated_volume (not the default 5000 or day N−1's volume).
+
+**Cross-repo (next traceability cycle — needs sibling repos free):**
+31. **Consumer-side `validate_export_dir` gate (hft-contracts)** — the higher-leverage "monitorable" win: assert manifest↔disk count parity + uniform schema/commit per export dir, reusing the per-day `validate_off_exchange_export_contract`. Would auto-catch a stale/corrupt export (e.g. the current `basic_nvda_60s`). Approved design in monorepo `FOUNDATION_INTEGRITY_PLAN_2026_05.md`; the producer-side traceability shipped 2026-05-29 is its prerequisite. Blocked while hft-contracts is sister-active.
+32. **hft-ops BASIC extraction stage (M-3)** — a `BasicExtractionRunner` parallel to the MBO `ExtractionRunner` so BASIC datasets get orchestrated/cached/ledgered runs (currently CLI-only via `export_dataset`). Harvest the new per-day diagnostics sidecar as the dataset-health surface.
+33. **Re-export `basic_nvda_60s`** — refresh the stale live export so the DATA carries `config_hash` + git provenance + diagnostics sidecars (needs the external SSD + confirmation BASIC is on-roadmap).
 
 ---
 
