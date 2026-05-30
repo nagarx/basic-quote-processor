@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 490 tests
-cargo test --lib               # Run 427 lib tests only
+cargo test                     # Run all 494 tests
+cargo test --lib               # Run 431 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -186,7 +186,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (427 lib)
+## Test Inventory (431 lib)
 
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -199,7 +199,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | config.rs | 33 | All config types, validation, TOML roundtrip |
 | sampling/*.rs | 14 | EST/EDT, gap detection, session boundaries |
 | accumulator/*.rs | 73 | Sub-accumulators, reset, diagnostics, volumes |
-| features/*.rs | 18 | All 34 formulas, indices, classification |
+| features/*.rs | 22 | All 34 formulas, indices, classification, sign-convention contract (§10) |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
 | labeling/*.rs | 22 | Point-return, forward prices, golden tests |
 | export/*.rs | 46 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
@@ -262,7 +262,7 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 3. **File with only trades, no quotes** — verify `TradeClassifier` correctly returns `Unsigned + Unknown` for all trades when no BBO updates exist.
 4. **Truly empty `.dbn.zst` file** — current `test_edge_empty_iterator` uses `.take(0)`; need a test on a zero-record file.
 5. **Convert `debug_assert!` → `assert!` in `src/features/mod.rs:164-179`** for safety_gates, schema_version, session_progress range — **RESOLVED in commit 8e46608 (2026-05-28)** — 6 `debug_assert!` calls promoted to `assert!`, enforcing `bin_valid`, `bbo_valid`, `schema_version`, `session_progress` invariants in release builds. One `debug_assert!` for `extract_context` regime sanity remains intentional (covered by `match` exhaustiveness).
-6. **Sign convention contract test** — explicit per-feature: `buy_vol > sell_vol` ⇒ `trf_signed_imbalance > 0`; same for mroib, bvc_imbalance, quote_imbalance.
+6. **Sign convention contract test** — explicit per-feature: `buy_vol > sell_vol` ⇒ `trf_signed_imbalance > 0`; same for mroib, bvc_imbalance, quote_imbalance. **RESOLVED (2026-05-30)**: 4 `test_sign_convention_*` tests in `features/mod.rs` lock all 5 signed features (incl. the `INV_INST_DIRECTION = -MROIB` inversion) across buy-pressure>0 / sell-pressure<0 / balanced==0; BVC driven via `accumulate_bvc`, QUOTE via the BBO snapshot.
 7. **VPIN below bucket_volume fallback** — feed one trade; verify `trf_vpin = 0.0` (not NaN).
 8. **Gap-bin-at-end-of-day** — synthetic stream where the last emitted bin is a gap; verify `last_bin_end_ns` reflects the gap.
 9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.

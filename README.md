@@ -25,7 +25,7 @@ Key capabilities:
 # Build
 cargo build --release
 
-# Run all tests (427 lib + 63 integration)
+# Run all tests (431 lib + 63 integration)
 cargo test
 
 # Lint
@@ -68,7 +68,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
                     dates.rs --> weekday enumeration, split assignment
 ```
 
-13 modules, 42 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`hash.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 6 integration test files, **490 tests** (427 lib + 63 integration).
+13 modules, 42 Rust source files (35 inside the 13 modules + `lib.rs`/`error.rs`/`contract.rs`/`hash.rs`/`pipeline.rs`/`context.rs`/`dates.rs` at `src/` root, plus 3 binaries in `src/bin/`), 6 integration test files, **494 tests** (431 lib + 63 integration).
 
 ## Feature Groups (34 total, indices 0-33)
 
@@ -149,7 +149,7 @@ OHLCV-1D consolidated daily summary. Used for coverage validation and context fe
 
 ## Testing
 
-490 tests total: 427 library unit tests + 63 integration tests.
+494 tests total: 431 library unit tests + 63 integration tests.
 
 Integration tests require Databento XNAS.BASIC CMBP-1 data files. All integration tests are gated by `data_available()` and skip gracefully when data is not present — `cargo test` will always succeed on a fresh clone, but integration tests will report as passed (skipped) rather than ignored.
 

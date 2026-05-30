@@ -529,6 +529,138 @@ mod tests {
         );
     }
 
+    // ── Sign-convention contract (hft-rules §10) ────────────────────
+    // First-class invariant: > 0 = bullish / buy-pressure, < 0 = bearish,
+    // = 0 = balanced (§10). These lock the DIRECTION of every signed feature
+    // across +/-/0, complementing the single-point golden tests above — which
+    // only asserted the POSITIVE case of TRF/MROIB; BVC, QUOTE, and every
+    // negative/balanced case were previously unguarded (a silent sign flip
+    // would have inverted every downstream signal). Each feature is driven by
+    // its own deterministic mechanism; sign is asserted, not magnitude.
+
+    #[test]
+    fn test_sign_convention_trf_signed_imbalance() {
+        let imbalance = |buy: u32, sell: u32| -> f64 {
+            let ext = default_extractor();
+            let mut acc = default_accumulator();
+            let bbo = make_bbo(134.56, 134.57, 100, 100);
+            acc.accumulate(&ClassifiedTrade {
+                direction: TradeDirection::Buy,
+                retail_status: RetailStatus::Institutional,
+                price: 134.5675, size: buy,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + 10_000_000_000,
+            });
+            acc.accumulate(&ClassifiedTrade {
+                direction: TradeDirection::Sell,
+                retail_status: RetailStatus::Institutional,
+                price: 134.5625, size: sell,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + 20_000_000_000,
+            });
+            acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+            let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+            let mut output = Vec::new();
+            ext.extract(&acc, &bbo, &boundary, &mut output);
+            output[TRF_SIGNED_IMBALANCE]
+        };
+        assert!(imbalance(500, 300) > 0.0, "trf buy>sell must be bullish (>0)");
+        assert!(imbalance(300, 500) < 0.0, "trf sell>buy must be bearish (<0)");
+        assert_eq!(imbalance(400, 400), 0.0, "trf buy==sell must be exactly 0");
+    }
+
+    #[test]
+    fn test_sign_convention_mroib_inv_inst_direction() {
+        // INV_INST_DIRECTION = -MROIB: retail buying IS institutional selling, so
+        // the inverse-institutional signal flips sign. This inversion is the
+        // highest-risk sign nuance in the layout — lock it explicitly.
+        let mroib_inv = |r_buy: u32, r_sell: u32| -> (f64, f64) {
+            let ext = default_extractor();
+            let mut acc = default_accumulator();
+            let bbo = make_bbo(134.56, 134.57, 100, 100);
+            acc.accumulate(&ClassifiedTrade {
+                direction: TradeDirection::Buy,
+                retail_status: RetailStatus::Retail,
+                price: 134.5675, size: r_buy,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + 10_000_000_000,
+            });
+            acc.accumulate(&ClassifiedTrade {
+                direction: TradeDirection::Sell,
+                retail_status: RetailStatus::Retail,
+                price: 134.5625, size: r_sell,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + 20_000_000_000,
+            });
+            acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+            let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+            let mut output = Vec::new();
+            ext.extract(&acc, &bbo, &boundary, &mut output);
+            (output[MROIB], output[INV_INST_DIRECTION])
+        };
+        let (m_pos, i_pos) = mroib_inv(200, 100);
+        assert!(m_pos > 0.0, "retail buy>sell must be MROIB>0");
+        assert!(i_pos < 0.0, "INV_INST_DIRECTION must be <0 when retail is bullish (inverted)");
+        assert!((i_pos + m_pos).abs() < 1e-12, "INV_INST_DIRECTION must equal -MROIB exactly");
+        let (m_neg, i_neg) = mroib_inv(100, 200);
+        assert!(m_neg < 0.0, "retail sell>buy must be MROIB<0");
+        assert!(i_neg > 0.0, "INV_INST_DIRECTION must be >0 when retail is bearish (inverted)");
+        let (m_bal, i_bal) = mroib_inv(150, 150);
+        assert_eq!(m_bal, 0.0, "balanced retail must be MROIB==0");
+        assert_eq!(i_bal, 0.0, "balanced retail must be INV_INST_DIRECTION==0");
+    }
+
+    #[test]
+    fn test_sign_convention_bvc_imbalance() {
+        // BVC_IMBALANCE = (bvc_buy - bvc_sell)/(bvc_buy + bvc_sell). BVC's
+        // probabilistic price-split is tested in flow_accumulator.rs; here we
+        // drive the accumulated volumes directly (accumulate_bvc) to isolate the
+        // extract-formula sign convention. BVC_IMBALANCE (idx 3) is NOT
+        // forward-filled, so a zero-trade bin is valid.
+        let bvc_imb = |buy: f64, sell: f64| -> f64 {
+            let ext = default_extractor();
+            let mut acc = default_accumulator();
+            let bbo = make_bbo(134.56, 134.57, 100, 100);
+            acc.flow.accumulate_bvc(buy, sell);
+            acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+            let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+            let mut output = Vec::new();
+            ext.extract(&acc, &bbo, &boundary, &mut output);
+            output[BVC_IMBALANCE]
+        };
+        assert!(bvc_imb(600.0, 400.0) > 0.0, "bvc_buy>bvc_sell must be bullish (>0)");
+        assert!(bvc_imb(400.0, 600.0) < 0.0, "bvc_sell>bvc_buy must be bearish (<0)");
+        assert_eq!(bvc_imb(500.0, 500.0), 0.0, "balanced BVC must be exactly 0");
+    }
+
+    #[test]
+    fn test_sign_convention_quote_imbalance() {
+        // QUOTE_IMBALANCE = (bid_sz - ask_sz)/(bid_sz + ask_sz): bid-depth
+        // dominance is bid-side (bullish) pressure. Accumulate 1 TRF trade so
+        // trf_trades>0 disables the empty-bin forward-fill (QUOTE_IMBALANCE IS a
+        // forward-filled state feature); the depths come from the BBO snapshot.
+        let quote_imb = |bid_sz: u32, ask_sz: u32| -> f64 {
+            let ext = default_extractor();
+            let mut acc = default_accumulator();
+            let bbo = make_bbo(134.56, 134.57, bid_sz, ask_sz);
+            acc.accumulate(&ClassifiedTrade {
+                direction: TradeDirection::Buy,
+                retail_status: RetailStatus::Institutional,
+                price: 134.5675, size: 100,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + 10_000_000_000,
+            });
+            acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+            let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+            let mut output = Vec::new();
+            ext.extract(&acc, &bbo, &boundary, &mut output);
+            output[QUOTE_IMBALANCE]
+        };
+        assert!(quote_imb(200, 100) > 0.0, "bid_sz>ask_sz must be bid-pressure (>0)");
+        assert!(quote_imb(100, 200) < 0.0, "ask_sz>bid_sz must be ask-pressure (<0)");
+        assert_eq!(quote_imb(150, 150), 0.0, "balanced depth must be exactly 0");
+    }
+
     #[test]
     fn test_dark_share_golden() {
         let ext = default_extractor();
