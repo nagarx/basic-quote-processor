@@ -338,4 +338,58 @@ mod tests {
         assert_eq!(ff.values[SLOT_SPREAD_BPS], 8.5);
         assert_eq!(ff.values[SLOT_QUOTE_IMBALANCE], -0.15);
     }
+
+    /// SSoT lock (hft-rules §0/§1): the slot tables in THIS module and the
+    /// canonical index lists in `indices` are two hand-maintained encodings of
+    /// the same fact (which feature indices forward-fill, and the BBO Level-2/3
+    /// split). If a future feature-set change adds/removes a forward-fill index
+    /// in one place but not the other, a feature would be silently never
+    /// forward-filled (or the BBO split would drift). `indices.rs`'s
+    /// `test_all_indices_classified` iterates `FORWARD_FILL_INDICES` only and
+    /// never inspects these slot tables — so this is the ONLY guard that locks
+    /// the two modules together.
+    #[test]
+    fn test_slot_tables_match_indices_ssot() {
+        use std::collections::HashSet;
+
+        let trf: HashSet<usize> = TRF_STATE_SLOTS.iter().map(|&(_, idx)| idx).collect();
+        let bbo: HashSet<usize> = BBO_STATE_SLOTS.iter().map(|&(_, idx)| idx).collect();
+        let vpin: HashSet<usize> = VPIN_STATE_SLOTS.iter().map(|&(_, idx)| idx).collect();
+
+        // BBO half must equal the canonical BBO_STATE_INDICES exactly.
+        assert_eq!(
+            bbo,
+            indices::BBO_STATE_INDICES.iter().copied().collect::<HashSet<_>>(),
+            "BBO_STATE_SLOTS indices must equal indices::BBO_STATE_INDICES (SSoT drift)"
+        );
+
+        // TRF ∪ BBO must equal the canonical FORWARD_FILL_INDICES exactly.
+        let mut base = trf.clone();
+        base.extend(&bbo);
+        assert_eq!(
+            base,
+            indices::FORWARD_FILL_INDICES.iter().copied().collect::<HashSet<_>>(),
+            "TRF_STATE_SLOTS ∪ BBO_STATE_SLOTS must equal indices::FORWARD_FILL_INDICES \
+             (a forward-fill index was added/removed in one module but not the other)"
+        );
+
+        // VPIN half must equal the canonical FORWARD_FILL_VPIN_INDICES exactly.
+        assert_eq!(
+            vpin,
+            indices::FORWARD_FILL_VPIN_INDICES.iter().copied().collect::<HashSet<_>>(),
+            "VPIN_STATE_SLOTS indices must equal indices::FORWARD_FILL_VPIN_INDICES (SSoT drift)"
+        );
+
+        // The TRF and BBO halves must be disjoint (the Level-2/3 split is exclusive).
+        assert!(
+            trf.is_disjoint(&bbo),
+            "TRF and BBO slot halves must be disjoint"
+        );
+
+        // Cardinality sanity: 8 TRF-state + 2 BBO-state = 10 forward-fill base
+        // indices, plus 2 VPIN-state indices.
+        assert_eq!(trf.len(), 8, "expected 8 TRF-state slots");
+        assert_eq!(bbo.len(), 2, "expected 2 BBO-state slots");
+        assert_eq!(vpin.len(), 2, "expected 2 VPIN-state slots");
+    }
 }

@@ -355,4 +355,78 @@ mod tests {
         // Verify window size grew correctly
         assert_eq!(bvc.window_size(), 5, "Should have 5 price changes in window");
     }
+
+    #[test]
+    fn test_eviction_shrinks_window_and_changes_sigma() {
+        // Coverage for the rolling-window eviction loop in classify_trade (the
+        // `while let Some(&oldest_ts)` block). Every OTHER BVC test keeps all
+        // trades within the 1-min window (e.g. test_golden_bvc_determinism_sequence
+        // asserts window_size()==5 = nothing evicted), so this is the ONLY test
+        // that exercises eviction. A broken eviction silently corrupts sigma →
+        // the exported `bvc_imbalance` feature (idx 3).
+        let mut bvc = BvcState::new(1); // window_ns = 60s
+        let w = 60 * NS_PER_SECOND;
+
+        // Seed 3 trades with large moves, all "old" (t = 0, 1s, 2s).
+        bvc.classify_trade(100.00, 100, 0);
+        bvc.classify_trade(100.50, 100, NS_PER_SECOND);
+        bvc.classify_trade(101.00, 100, 2 * NS_PER_SECOND);
+        assert_eq!(bvc.window_size(), 3, "all 3 entries within window before eviction");
+        let sigma_big = bvc.current_sigma();
+        assert!(sigma_big > 0.0, "3 differing deltas → sigma > 0, got {sigma_big}");
+
+        // A trade strictly beyond the window past the OLDEST entry
+        // (t = 2s + window_ns + 1ns) with a tiny move. The current trade is
+        // always retained (ts - ts = 0 ≤ window_ns); the 3 stale entries must be
+        // evicted, leaving exactly 1.
+        let far_ts = 2 * NS_PER_SECOND + w + 1;
+        bvc.classify_trade(101.001, 100, far_ts);
+
+        // BITE: loop-deletion, direction-flip (`>`→`<`), and a saturating_sub
+        // operand-swap all leave window_size == 4 here (nothing evicted).
+        assert_eq!(
+            bvc.window_size(),
+            1,
+            "eviction must drop the 3 entries older than window_ns; only the new trade survives"
+        );
+        // BITE: with 1 surviving obs compute_sigma() returns 0.0 (n < 2); if
+        // eviction were removed, the 3 large stale deltas would keep sigma > 0.
+        let sigma_after = bvc.current_sigma();
+        assert_eq!(sigma_after, 0.0, "1 surviving obs → sample-std undefined → 0.0");
+        assert!(
+            (sigma_after - sigma_big).abs() > 1e-6,
+            "sigma MUST change across eviction: {sigma_big} (with stale) vs {sigma_after} (after)"
+        );
+    }
+
+    #[test]
+    fn test_eviction_boundary_is_strict_greater_than() {
+        // Locks the STRICT `>` in the eviction predicate
+        // (`ts_ns - oldest_ts > window_ns`), distinguishing it from `>=` and `<`.
+        let mut bvc = BvcState::new(1); // window_ns = 60s
+        let w = 60 * NS_PER_SECOND;
+
+        bvc.classify_trade(100.0, 100, 0); // entry @ t=0
+        bvc.classify_trade(100.1, 100, NS_PER_SECOND); // entry @ t=1s
+
+        // New trade at EXACTLY t = window_ns: the diff for the oldest entry (t=0)
+        // is exactly window_ns, which is NOT `> window_ns` → it is KEPT.
+        // BITE: under `>=` the t=0 entry would be evicted → window_size 2.
+        bvc.classify_trade(100.2, 100, w);
+        assert_eq!(
+            bvc.window_size(),
+            3,
+            "at exactly window_ns the oldest entry is KEPT (strict >); `>=` would evict it"
+        );
+
+        // One nanosecond past the boundary: the diff for the oldest (t=0) is
+        // window_ns + 1 > window_ns → EVICT exactly that one entry.
+        // BITE: under `<` (direction flip) nothing would evict → window_size 4.
+        bvc.classify_trade(100.3, 100, w + 1);
+        assert_eq!(
+            bvc.window_size(),
+            3,
+            "added 1 (→4) then evicted the t=0 entry (window_ns+1 > window_ns) → 3; `<` would leave 4"
+        );
+    }
 }
