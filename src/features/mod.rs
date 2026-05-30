@@ -661,6 +661,259 @@ mod tests {
         assert_eq!(quote_imb(150, 150), 0.0, "balanced depth must be exactly 0");
     }
 
+    // ── Golden value tests for previously-uncovered features (#11) ──
+    // Expected values are hand-derived from the §5 formulas (magnitude, not just
+    // sign). Each scenario is constructed so the expected value is exact.
+
+    /// Accumulate the given TRF (publisher FINN) trades into one bin and return
+    /// the extracted feature vector. Auto-incrementing timestamps; fixed price
+    /// (the features under test depend on size/direction/retail, not price).
+    fn extract_trf_trades(trades: &[(TradeDirection, RetailStatus, u32)], bbo: &BboState) -> Vec<f64> {
+        let ext = default_extractor();
+        let mut acc = default_accumulator();
+        for (i, &(dir, retail, size)) in trades.iter().enumerate() {
+            acc.accumulate(&ClassifiedTrade {
+                direction: dir,
+                retail_status: retail,
+                price: 134.5675,
+                size,
+                publisher_id: publisher::FINN,
+                ts_recv: ext.market_open_ns + (10 + i as u64 * 5) * 1_000_000_000,
+            });
+        }
+        acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+        let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+        let mut output = Vec::new();
+        ext.extract(&acc, bbo, &boundary, &mut output);
+        output
+    }
+
+    #[test]
+    fn test_retail_volume_fraction_golden() {
+        // retail_total_vol / trf_total_vol = 200 / (200+300) = 0.4
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        let out = extract_trf_trades(
+            &[
+                (TradeDirection::Buy, RetailStatus::Retail, 200),
+                (TradeDirection::Buy, RetailStatus::Institutional, 300),
+            ],
+            &bbo,
+        );
+        assert!(
+            (out[RETAIL_VOLUME_FRACTION] - 0.4).abs() < 1e-10,
+            "expected 0.4, got {}",
+            out[RETAIL_VOLUME_FRACTION]
+        );
+    }
+
+    #[test]
+    fn test_mean_trade_size_golden() {
+        // total_volume / total_trades = (100+300) / 2 = 200
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        let out = extract_trf_trades(
+            &[
+                (TradeDirection::Buy, RetailStatus::Institutional, 100),
+                (TradeDirection::Sell, RetailStatus::Institutional, 300),
+            ],
+            &bbo,
+        );
+        assert!(
+            (out[MEAN_TRADE_SIZE] - 200.0).abs() < 1e-10,
+            "expected 200.0, got {}",
+            out[MEAN_TRADE_SIZE]
+        );
+    }
+
+    #[test]
+    fn test_block_trade_ratio_golden() {
+        // block_trades / total_trades = 1 / 2 = 0.5 (default block threshold 10_000)
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        let out = extract_trf_trades(
+            &[
+                (TradeDirection::Buy, RetailStatus::Institutional, 15_000), // block
+                (TradeDirection::Buy, RetailStatus::Institutional, 100),    // not block
+            ],
+            &bbo,
+        );
+        assert!(
+            (out[BLOCK_TRADE_RATIO] - 0.5).abs() < 1e-10,
+            "expected 0.5, got {}",
+            out[BLOCK_TRADE_RATIO]
+        );
+    }
+
+    #[test]
+    fn test_odd_lot_ratio_golden() {
+        // odd_lot_trades / trf_trades = 1 / 2 = 0.5 (odd lot = TRF size < 100)
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        let out = extract_trf_trades(
+            &[
+                (TradeDirection::Buy, RetailStatus::Institutional, 50),  // odd lot
+                (TradeDirection::Buy, RetailStatus::Institutional, 200), // round lot
+            ],
+            &bbo,
+        );
+        assert!(
+            (out[ODD_LOT_RATIO] - 0.5).abs() < 1e-10,
+            "expected 0.5, got {}",
+            out[ODD_LOT_RATIO]
+        );
+    }
+
+    #[test]
+    fn test_retail_trade_rate_golden() {
+        // retail_trades / trf_trades = 1 / 2 = 0.5
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        let out = extract_trf_trades(
+            &[
+                (TradeDirection::Buy, RetailStatus::Retail, 100),
+                (TradeDirection::Buy, RetailStatus::Institutional, 100),
+            ],
+            &bbo,
+        );
+        assert!(
+            (out[RETAIL_TRADE_RATE] - 0.5).abs() < 1e-10,
+            "expected 0.5, got {}",
+            out[RETAIL_TRADE_RATE]
+        );
+    }
+
+    #[test]
+    fn test_quote_imbalance_golden() {
+        // (bid_sz - ask_sz)/(bid_sz + ask_sz) = (300-100)/400 = 0.5.
+        // 1 trade keeps trf_trades>0 so the empty-bin forward-fill does not run.
+        let bbo = make_bbo(134.56, 134.57, 300, 100);
+        let out = extract_trf_trades(&[(TradeDirection::Buy, RetailStatus::Institutional, 100)], &bbo);
+        assert!(
+            (out[QUOTE_IMBALANCE] - 0.5).abs() < 1e-10,
+            "expected 0.5, got {}",
+            out[QUOTE_IMBALANCE]
+        );
+    }
+
+    #[test]
+    fn test_trf_lit_volume_ratio_golden() {
+        // trf_total_vol / lit_vol = 600 / 300 = 2.0 (FINN=TRF, XNAS=lit)
+        let ext = default_extractor();
+        let mut acc = default_accumulator();
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        acc.accumulate(&ClassifiedTrade {
+            direction: TradeDirection::Buy,
+            retail_status: RetailStatus::Institutional,
+            price: 134.5675,
+            size: 600,
+            publisher_id: publisher::FINN,
+            ts_recv: ext.market_open_ns + 10_000_000_000,
+        });
+        acc.accumulate(&ClassifiedTrade {
+            direction: TradeDirection::Unsigned,
+            retail_status: RetailStatus::Institutional,
+            price: 134.565,
+            size: 300,
+            publisher_id: publisher::XNAS,
+            ts_recv: ext.market_open_ns + 20_000_000_000,
+        });
+        acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+        let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+        let mut output = Vec::new();
+        ext.extract(&acc, &bbo, &boundary, &mut output);
+        assert!(
+            (output[TRF_LIT_VOLUME_RATIO] - 2.0).abs() < 1e-10,
+            "expected 2.0, got {}",
+            output[TRF_LIT_VOLUME_RATIO]
+        );
+    }
+
+    #[test]
+    fn test_spread_change_rate_golden() {
+        // spread_change_rate = bbo_end.spread_bps() - spread_bps_start.
+        // start (99,101): (101-99)/100*10000 = 200; end (98,102): 4/100*10000 = 400.
+        // change = 400 - 200 = 200.
+        let ext = default_extractor();
+        let mut acc = default_accumulator();
+        let start_bbo = make_bbo(99.0, 101.0, 100, 100);
+        acc.accumulate_bbo_update(&start_bbo, ext.market_open_ns + 1_000_000_000);
+        let end_bbo = make_bbo(98.0, 102.0, 100, 100);
+        acc.prepare_for_extraction(ext.market_open_ns + 60_000_000_000);
+        let boundary = make_boundary(ext.market_open_ns + 60_000_000_000, 0);
+        let mut output = Vec::new();
+        ext.extract(&acc, &end_bbo, &boundary, &mut output);
+        assert!(
+            (output[SPREAD_CHANGE_RATE] - 200.0).abs() < 1e-9,
+            "expected 200.0, got {}",
+            output[SPREAD_CHANGE_RATE]
+        );
+    }
+
+    #[test]
+    fn test_time_bucket_afternoon_and_close_auction() {
+        // #11: regimes 4 (afternoon 15:00-15:55 ET -> bucket 3) and 5
+        // (close-auction 15:55-16:00 ET -> bucket 4) were uncovered (the existing
+        // mapping test only checks buckets 0/1). Market open = 09:30 ET, so
+        // +6h = 15:30 ET (afternoon), +6h27m = 15:57 ET (close-auction).
+        let ext = default_extractor();
+        let acc = default_accumulator();
+        let bbo = make_bbo(100.0, 100.01, 100, 100);
+        let mut output = Vec::new();
+
+        let afternoon = BinBoundary {
+            bin_end_ts: ext.market_open_ns + (6 * 3600 + 1) * 1_000_000_000u64,
+            bin_midpoint_ts: ext.market_open_ns + (6 * 3600) * 1_000_000_000u64, // 15:30 ET
+            bin_index: 360,
+            gap_bins: 0,
+        };
+        ext.extract(&acc, &bbo, &afternoon, &mut output);
+        assert_eq!(output[TIME_BUCKET], 3.0, "15:30 ET must be afternoon bucket 3");
+
+        let close_auction = BinBoundary {
+            bin_end_ts: ext.market_open_ns + (6 * 3600 + 27 * 60 + 1) * 1_000_000_000u64,
+            bin_midpoint_ts: ext.market_open_ns + (6 * 3600 + 27 * 60) * 1_000_000_000u64, // 15:57 ET
+            bin_index: 387,
+            gap_bins: 0,
+        };
+        ext.extract(&acc, &bbo, &close_auction, &mut output);
+        assert_eq!(output[TIME_BUCKET], 4.0, "15:57 ET must be close-auction bucket 4");
+    }
+
+    #[test]
+    fn test_vpin_fallback_below_bucket_returns_zero_not_nan() {
+        // #7/#11: with VPIN enabled but fewer shares than one bucket_volume, the
+        // VpinComputer has no completed bucket => current_vpin() is None =>
+        // unwrap_or(0.0). Verifies the fallback is finite and exactly 0.0 (never
+        // NaN). Requires the EXTRACTOR's config to have vpin=true so extract_vpin
+        // runs the current_vpin() path (not the resize default).
+        let feat = FeatureConfig { vpin: true, ..FeatureConfig::default() };
+        let mut ext = FeatureExtractor::new(
+            &feat,
+            &ValidationConfig::default(),
+            SamplingConfig::default().bin_size_seconds,
+        );
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 2, 3).unwrap();
+        let midnight = date.and_hms_opt(0, 0, 0).unwrap().and_utc()
+            .timestamp_nanos_opt().unwrap() as u64;
+        let open = midnight + (14 * 3600 + 30 * 60) * 1_000_000_000;
+        let close = open + (6 * 3600 + 30 * 60) * 1_000_000_000;
+        ext.init_day(-5, open, close);
+
+        let mut acc = BinAccumulator::new(&ValidationConfig::default(), &VpinConfig::default(), &feat);
+        let bbo = make_bbo(134.56, 134.57, 100, 100);
+        acc.accumulate(&ClassifiedTrade {
+            direction: TradeDirection::Buy,
+            retail_status: RetailStatus::Institutional,
+            price: 134.5675,
+            size: 100, // << one bucket_volume => no completed VPIN bucket
+            publisher_id: publisher::FINN,
+            ts_recv: open + 10_000_000_000,
+        });
+        acc.prepare_for_extraction(open + 60_000_000_000);
+        let boundary = make_boundary(open + 60_000_000_000, 0);
+        let mut output = Vec::new();
+        ext.extract(&acc, &bbo, &boundary, &mut output);
+
+        assert!(output[TRF_VPIN].is_finite(), "TRF_VPIN must be finite (not NaN) on insufficient data");
+        assert_eq!(output[TRF_VPIN], 0.0, "VPIN below one bucket_volume must fall back to exactly 0.0");
+    }
+
     #[test]
     fn test_dark_share_golden() {
         let ext = default_extractor();

@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 494 tests
-cargo test --lib               # Run 431 lib tests only
+cargo test                     # Run all 504 tests
+cargo test --lib               # Run 441 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -186,7 +186,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (431 lib)
+## Test Inventory (441 lib)
 
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -199,7 +199,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | config.rs | 33 | All config types, validation, TOML roundtrip |
 | sampling/*.rs | 14 | EST/EDT, gap detection, session boundaries |
 | accumulator/*.rs | 73 | Sub-accumulators, reset, diagnostics, volumes |
-| features/*.rs | 22 | All 34 formulas, indices, classification, sign-convention contract (§10) |
+| features/*.rs | 32 | All 34 formulas, indices, classification, sign-convention contract (§10), golden value tests (#11) |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
 | labeling/*.rs | 22 | Point-return, forward prices, golden tests |
 | export/*.rs | 46 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
@@ -267,7 +267,7 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 8. **Gap-bin-at-end-of-day** — synthetic stream where the last emitted bin is a gap; verify `last_bin_end_ns` reflects the gap.
 9. **`set_session_end()` impact** — verify session_progress clamping respects the auto-detected end.
 10. **Integration test gating** — **RESOLVED in this commit (PARTIAL)** — all 5 integration test files (`classifier_test`, `integration_test`, `phase3_test`, `phase4_test`, `phase5_test`) now panic if data is missing AND `CI` env var is set, preserving local-dev silent-skip behavior otherwise. Same pattern applied to `equs_available()` in phase5_test. Note: a few orphan path-checks (e.g., `test_discover_files`, second-day path in `classifier_test::test_no_state_leakage_between_days`) bypass `data_available()` and remain silent-skip — fix in a follow-up.
-11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback.
+11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback. **RESOLVED (2026-05-30)**: 10 golden/value tests in `features/mod.rs` (hand-derived from §5 formulas) — shared `extract_trf_trades` helper for the count/volume ratios; inline setup for `spread_change_rate` (`accumulate_bbo_update`), `time_bucket` regimes 4/5 (afternoon/close-auction boundaries), and the VPIN fallback (vpin-enabled config → `current_vpin()` None → exactly 0.0).
 12. **`git_commit` / `git_dirty` provenance via `build.rs`** — **RESOLVED (2026-05-29)** — `build.rs` shells to `git rev-parse HEAD` + `git diff --quiet HEAD` at compile time, exposing `GIT_COMMIT_HASH`/`GIT_DIRTY` rustc-env vars consumed via `option_env!` in `ProvenanceMeta` (`src/export/metadata.rs`), which now emits `git_commit` + `git_dirty` ("unknown"/false fallback). Mirrors the MBO extractor `build.rs`. Crate version also bumped `0.1.0` → `0.9.0` so `processor_version` is a meaningful staleness signal.
 13. **Frozen golden-hash regression test** — **RESOLVED in commit 8e46608 (2026-05-28)** — `test_config_hash_golden_regression` in `src/config.rs` pins SHA-256 `c142f46663ae401bd9ae3250b3f7e9d3047b09db425d19050aecfdbb22ea11fa` for the `sample_processor_config()` fixture; detects drift from serde_derive, toml minor version bumps, or accidental struct-field reordering.
 14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+).
