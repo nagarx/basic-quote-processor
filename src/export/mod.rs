@@ -253,7 +253,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let norm_json = normalizer.to_json(day).unwrap();
+        let norm_json = normalizer.to_json(day, "none").unwrap();
 
         DayExport {
             day: day.to_string(),

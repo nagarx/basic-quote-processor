@@ -146,7 +146,13 @@ impl NormalizationComputer {
     }
 
     /// Build the normalization result for JSON export.
-    pub fn finalize(&self, day: &str) -> NormalizationResult {
+    ///
+    /// `strategy` is the configured normalization-strategy label (e.g. `"none"`
+    /// for raw v3p0-style exports, `"per_day_zscore"` when applied). It is
+    /// recorded verbatim in the sidecar so the artifact's reported strategy
+    /// matches `metadata.json` + the actual on-disk data (hft-rules §11). The
+    /// per-feature stats (mean/std/min/max) are computed regardless of strategy.
+    pub fn finalize(&self, day: &str, strategy: &str) -> NormalizationResult {
         let sample_count = self.total_updates;
 
         let features: Vec<FeatureStats> = (0..self.n_features)
@@ -167,16 +173,17 @@ impl NormalizationComputer {
             .collect();
 
         NormalizationResult {
-            strategy: "per_day_zscore".to_string(),
+            strategy: strategy.to_string(),
             day: day.to_string(),
             sample_count,
             features,
         }
     }
 
-    /// Serialize normalization result to JSON string.
-    pub fn to_json(&self, day: &str) -> Result<String> {
-        let result = self.finalize(day);
+    /// Serialize normalization result to JSON string. `strategy` is forwarded
+    /// to `finalize` (the configured strategy label recorded in the sidecar).
+    pub fn to_json(&self, day: &str, strategy: &str) -> Result<String> {
+        let result = self.finalize(day, strategy);
         serde_json::to_string_pretty(&result)
             .map_err(|e| ProcessorError::export(format!("normalization JSON: {e}")))
     }
@@ -212,7 +219,7 @@ mod tests {
             fv[0] = val;
             nc.update(&fv);
         }
-        let result = nc.finalize("2025-02-03");
+        let result = nc.finalize("2025-02-03", "per_day_zscore");
         assert_eq!(result.sample_count, 4);
         // mean = 2.5, population std = sqrt(1.25) ≈ 1.118
         let stats = &result.features[0];
@@ -289,7 +296,7 @@ mod tests {
         fv[0] = 20.0;
         nc.update(&fv);
         // NaN should be skipped: mean = (10 + 20) / 2 = 15
-        let result = nc.finalize("test");
+        let result = nc.finalize("test", "per_day_zscore");
         assert!((result.features[0].mean - 15.0).abs() < 1e-10);
         assert_eq!(result.features[0].n_finite, 2);
         assert_eq!(result.features[0].n_nan, 1); // 3 samples - 2 finite = 1 NaN
@@ -313,7 +320,7 @@ mod tests {
     #[test]
     fn test_normalization_json_34_features() {
         let nc = default_normalizer();
-        let result = nc.finalize("2025-02-03");
+        let result = nc.finalize("2025-02-03", "per_day_zscore");
         assert_eq!(result.features.len(), TOTAL_FEATURES);
         for (i, stats) in result.features.iter().enumerate() {
             assert_eq!(stats.index, i);
@@ -326,7 +333,7 @@ mod tests {
         let mut nc = default_normalizer();
         let fv = vec![0.0; TOTAL_FEATURES];
         nc.update(&fv);
-        let json = nc.to_json("test").unwrap();
+        let json = nc.to_json("test", "per_day_zscore").unwrap();
         assert!(json.contains("\"n_nan\""), "JSON must contain n_nan field");
         assert!(json.contains("\"normalizable\""), "JSON must contain normalizable field");
     }
@@ -337,9 +344,30 @@ mod tests {
         let fv = vec![42.0; TOTAL_FEATURES];
         nc.update(&fv);
         nc.reset();
-        let result = nc.finalize("test");
+        let result = nc.finalize("test", "per_day_zscore");
         assert_eq!(result.sample_count, 0);
         assert_eq!(result.features[0].n_finite, 0);
+    }
+
+    #[test]
+    fn test_finalize_strategy_is_threaded_not_hardcoded() {
+        // ③: the sidecar's `strategy` label must reflect the CONFIGURED strategy
+        // (matching metadata.json + the actual on-disk data, hft-rules §11),
+        // NOT a hardcoded "per_day_zscore". The stats are computed either way.
+        let nc = default_normalizer();
+        assert_eq!(
+            nc.finalize("2025-02-03", "none").strategy, "none",
+            "strategy must be threaded from the caller, not hardcoded"
+        );
+        assert_eq!(
+            nc.finalize("2025-02-03", "per_day_zscore").strategy, "per_day_zscore"
+        );
+        // to_json forwards the same label.
+        let json = nc.to_json("2025-02-03", "none").unwrap();
+        assert!(
+            json.contains("\"strategy\": \"none\""),
+            "to_json must serialize the threaded strategy label"
+        );
     }
 
     #[test]

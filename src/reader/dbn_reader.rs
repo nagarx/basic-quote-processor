@@ -87,6 +87,7 @@ impl DbnReader {
                 decoder,
                 count: 0,
                 decode_errors: 0,
+                aborted: false,
             },
         ))
     }
@@ -106,6 +107,9 @@ pub struct RecordIterator<'a> {
     decoder: DynDecoder<'a, BufReader<File>>,
     count: u64,
     decode_errors: u64,
+    /// Set true if iteration aborted on `MAX_CONSECUTIVE_ERRORS` consecutive
+    /// decode failures (the record stream was truncated, not at true EOF).
+    aborted: bool,
 }
 
 impl RecordIterator<'_> {
@@ -117,6 +121,12 @@ impl RecordIterator<'_> {
     /// Number of decode errors encountered (records skipped).
     pub fn decode_errors(&self) -> u64 {
         self.decode_errors
+    }
+
+    /// Whether iteration aborted on too many consecutive decode errors,
+    /// truncating the record stream before true end-of-file.
+    pub fn aborted(&self) -> bool {
+        self.aborted
     }
 }
 
@@ -146,6 +156,7 @@ impl Iterator for RecordIterator<'_> {
                             consecutive_errors,
                             MAX_CONSECUTIVE_ERRORS
                         );
+                        self.aborted = true;
                         return None;
                     }
                     continue;

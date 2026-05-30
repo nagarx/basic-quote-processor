@@ -58,6 +58,18 @@ pub struct DaySummary {
     pub total_trf_volume: f64,
     /// Cumulative lit volume in shares.
     pub total_lit_volume: f64,
+    /// Count of in-session trades dropped from accumulation because their price
+    /// was invalid/sentinel (`price <= 0` or non-finite). Such trades reach no
+    /// feature statistic (incl. BVC), per docs/design/03_DATA_FLOW.md §"Price
+    /// sanity" (hft-rules §8: never silently drop without recording diagnostics).
+    pub dropped_invalid_price_trades: u64,
+    /// Reader-level decode errors for the day (records skipped on decode
+    /// failure). Injected by `DayPipeline::day_summary()` — the accumulator is
+    /// decode-agnostic, so `BinAccumulator::day_summary()` always sets this 0.
+    pub decode_errors: u64,
+    /// True if the reader aborted on too many consecutive decode errors,
+    /// truncating the day's record stream before EOF. Injected by the pipeline.
+    pub decode_truncated: bool,
 }
 
 /// Central accumulator orchestrating all per-bin state.
@@ -107,6 +119,8 @@ pub struct BinAccumulator {
     // Phase 5: cumulative volume
     total_trf_volume: f64,
     total_lit_volume: f64,
+    // Count of trades skipped by the invalid/sentinel-price guard in accumulate().
+    dropped_invalid_price_trades: u64,
 }
 
 impl BinAccumulator {
@@ -151,6 +165,7 @@ impl BinAccumulator {
             bin_size_ns: 0, // Set via set_bin_size_ns() after construction
             total_trf_volume: 0.0,
             total_lit_volume: 0.0,
+            dropped_invalid_price_trades: 0,
         }
     }
 
@@ -159,6 +174,19 @@ impl BinAccumulator {
     /// Dispatches to all sub-accumulators based on venue, direction, and retail status.
     /// BVC processes ALL trades (not TRF-only) per Easley et al. (2012).
     pub fn accumulate(&mut self, trade: &ClassifiedTrade) {
+        // Skip invalid/sentinel-price trades from ALL feature statistics.
+        // `TradeClassifier::classify` emits `price = 0.0` for UNDEF/non-positive
+        // trade prices (trade_classifier/mod.rs); per docs/design/03_DATA_FLOW.md
+        // §"Price sanity" such a record MUST be skipped, not accumulated. Without
+        // this guard a 0.0 price poisons the BVC sigma window (and the next
+        // trade's delta) and the real `size` inflates volume/count/size features.
+        // Mirrors the VPIN consumer's own price guard. The drop is counted and
+        // surfaced via DaySummary -> diagnostics sidecar (hft-rules §8).
+        if !(trade.price > 0.0 && trade.price.is_finite()) {
+            self.dropped_invalid_price_trades += 1;
+            return;
+        }
+
         let publisher = PublisherClass::from_id(trade.publisher_id);
         let is_trf = publisher.is_trf();
         let is_lit = publisher.is_lit();
@@ -274,6 +302,7 @@ impl BinAccumulator {
         self.last_bin_end_ns = 0;
         self.total_trf_volume = 0.0;
         self.total_lit_volume = 0.0;
+        self.dropped_invalid_price_trades = 0;
         // bin_size_ns preserved (config-derived, not per-day state)
     }
 
@@ -402,6 +431,11 @@ impl BinAccumulator {
             last_bin_end_ns: self.last_bin_end_ns,
             total_trf_volume: self.total_trf_volume,
             total_lit_volume: self.total_lit_volume,
+            dropped_invalid_price_trades: self.dropped_invalid_price_trades,
+            // Reader-level decode diagnostics are injected by
+            // DayPipeline::day_summary() (the accumulator never sees the reader).
+            decode_errors: 0,
+            decode_truncated: false,
         }
     }
 }
@@ -441,6 +475,54 @@ mod tests {
             publisher_id: publisher::XNAS, // Lit
             ts_recv: ts,
         }
+    }
+
+    #[test]
+    fn test_accumulate_skips_invalid_sentinel_price() {
+        // ①: classify() emits price=0.0 for UNDEF/non-positive trade prices;
+        // accumulate() MUST skip them from every feature statistic (incl. BVC),
+        // counting the drop (hft-rules §8). The guard is the first statement in
+        // accumulate(), so a skipped trade returns BEFORE bvc.classify_trade()
+        // (no sigma-window poisoning) and before every per-trade counter.
+        let mut acc = default_accumulator();
+
+        // Sentinel-price trade (price == 0.0), exactly as classify() produces.
+        let sentinel = make_trf_trade(
+            TradeDirection::Unsigned, RetailStatus::Unknown, 0.0, 500, 1_700_000_000_000_000_000,
+        );
+        acc.accumulate(&sentinel);
+        let s = acc.day_summary();
+        assert_eq!(s.dropped_invalid_price_trades, 1, "sentinel price must be counted as dropped");
+        assert_eq!(s.total_records_processed, 0, "sentinel price must NOT be processed (guard returned early)");
+        assert_eq!(s.total_trade_records, 0, "sentinel price must NOT count as a trade record");
+        assert_eq!(acc.counts.total_trades, 0, "no count from a dropped trade (BVC also never reached)");
+
+        // NaN and negative prices are likewise skipped.
+        let nan = make_trf_trade(
+            TradeDirection::Unsigned, RetailStatus::Unknown, f64::NAN, 500, 1_700_000_000_000_000_001,
+        );
+        acc.accumulate(&nan);
+        let neg = make_trf_trade(
+            TradeDirection::Unsigned, RetailStatus::Unknown, -1.0, 500, 1_700_000_000_000_000_002,
+        );
+        acc.accumulate(&neg);
+        assert_eq!(acc.day_summary().dropped_invalid_price_trades, 3, "NaN + negative prices also dropped");
+        assert_eq!(acc.counts.total_trades, 0, "still nothing accumulated after 3 invalid trades");
+    }
+
+    #[test]
+    fn test_accumulate_processes_valid_price_unaffected_by_guard() {
+        // Regression guard: a valid positive price is NOT dropped — fully accumulated.
+        let mut acc = default_accumulator();
+        let valid = make_trf_trade(
+            TradeDirection::Buy, RetailStatus::Retail, 134.25, 100, 1_700_000_000_000_000_000,
+        );
+        acc.accumulate(&valid);
+        let s = acc.day_summary();
+        assert_eq!(s.dropped_invalid_price_trades, 0, "valid price must NOT be dropped");
+        assert_eq!(s.total_records_processed, 1, "valid price must be processed");
+        assert_eq!(acc.counts.total_trades, 1, "valid trade counted");
+        assert_eq!(acc.flow.trf_buy_vol, 100.0, "valid trade flow accumulated");
     }
 
     #[test]

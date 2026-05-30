@@ -25,7 +25,12 @@ use crate::error::{ProcessorError, Result};
 /// on field rename/removal. Independent of `SCHEMA_VERSION` (the feature
 /// contract) and the MBO `PRODUCER_DIAGNOSTICS_SCHEMA_VERSION` (a different
 /// counter set).
-pub const BASIC_DIAGNOSTICS_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// History: 1.0.0 initial; 1.1.0 added `summary.dropped_invalid_price_trades`
+/// (additive — invalid/sentinel-price trades skipped from accumulation);
+/// 1.2.0 added `summary.decode_errors` + `summary.decode_truncated` (additive —
+/// reader decode-error count + truncation-on-abort flag, §8 observability).
+pub const BASIC_DIAGNOSTICS_SCHEMA_VERSION: &str = "1.2.0";
 
 /// Self-describing per-day diagnostics sidecar.
 ///
@@ -78,6 +83,9 @@ mod tests {
             last_bin_end_ns: 1_700_023_400_000_000_000,
             total_trf_volume: 12_345.0,
             total_lit_volume: 54_321.0,
+            dropped_invalid_price_trades: 0,
+            decode_errors: 0,
+            decode_truncated: false,
         }
     }
 
@@ -106,7 +114,8 @@ mod tests {
             "warmup_bins_discarded", "gap_bins_emitted", "total_trf_trades",
             "total_lit_trades", "total_trade_records", "first_bin_start_ns",
             "first_bin_end_ns", "last_bin_end_ns", "total_trf_volume",
-            "total_lit_volume",
+            "total_lit_volume", "dropped_invalid_price_trades",
+            "decode_errors", "decode_truncated",
         ] {
             assert!(
                 parsed["summary"].get(field).is_some(),

@@ -84,6 +84,14 @@ pub struct DayPipeline {
     /// Phase 9.4 / D13: experiment identifier (from `DatasetExportConfig.experiment`).
     /// Set once at startup; preserved across `reset()`.
     experiment: Option<String>,
+
+    /// Per-day reader decode diagnostics (§8), captured at the end of
+    /// `stream_file` and cleared by `reset()`: count of records skipped on
+    /// decode error, and whether the reader aborted on too many consecutive
+    /// errors (silent truncation). Surfaced via `day_summary()` into the
+    /// `{day}_diagnostics.json` sidecar.
+    decode_errors: u64,
+    decode_truncated: bool,
 }
 
 impl DayPipeline {
@@ -122,6 +130,8 @@ impl DayPipeline {
             normalization_strategy: None,
             normalization_applied: None,
             experiment: None,
+            decode_errors: 0,
+            decode_truncated: false,
         })
     }
 
@@ -264,10 +274,10 @@ impl DayPipeline {
         );
 
         let reader = DbnReader::new(file_path)?;
-        let (_metadata, records) = reader.open()?;
+        let (_metadata, mut records) = reader.open()?;
         let warmup_bins = self.config.validation.warmup_bins as u64;
 
-        for record in records {
+        for record in records.by_ref() {
             // 1. Check bin boundary FIRST
             if let Some(boundary) = self.sampler.check_boundary(record.ts_recv) {
                 self.accumulator.prepare_for_extraction(boundary.bin_end_ts);
@@ -371,6 +381,12 @@ impl DayPipeline {
                 self.accumulator.accumulate(&classified);
             }
         }
+
+        // Capture reader decode diagnostics (§8): surface decode-error count +
+        // truncation (the 1000-consecutive-error abort) so a partially-corrupt
+        // day is visible offline in {day}_diagnostics.json, not silently clean.
+        self.decode_errors = records.decode_errors();
+        self.decode_truncated = records.aborted();
 
         // Flush last partial bin (FIX #13; Phase 9.2 / H2 extended to BBO-only)
         //
@@ -496,9 +512,11 @@ impl DayPipeline {
             }
         }
 
-        // 4. Build metadata
-        let summary = self.accumulator.day_summary();
-        let norm_json = self.normalizer.to_json(&self.day_str)?;
+        // 4. Build metadata (summary includes reader decode diagnostics)
+        let summary = self.day_summary();
+        let norm_json = self
+            .normalizer
+            .to_json(&self.day_str, self.normalization_strategy.as_deref().unwrap_or("none"))?;
 
         // F2 (Phase 9.4) — serialize the active config structs into metadata so
         // the export carries both the `config_hash` (identity) and the actual
@@ -661,11 +679,21 @@ impl DayPipeline {
         // experiment are per-run (preserve — constant across all days in a run).
         self.source_file = None;
         self.data_file_sha256 = None;
+        // Per-day reader decode diagnostics (cleared each day).
+        self.decode_errors = 0;
+        self.decode_truncated = false;
     }
 
     /// Day-level diagnostic summary.
+    ///
+    /// Augments the accumulator's per-bin counters with the reader-level decode
+    /// diagnostics (§8) captured during `stream_file`, so the full per-day
+    /// health surface is reported in one place (the diagnostics sidecar).
     pub fn day_summary(&self) -> DaySummary {
-        self.accumulator.day_summary()
+        let mut summary = self.accumulator.day_summary();
+        summary.decode_errors = self.decode_errors;
+        summary.decode_truncated = self.decode_truncated;
+        summary
     }
 
     /// Number of post-warmup bins collected so far.
@@ -694,6 +722,14 @@ impl DayPipeline {
         for fv in &self.feature_bins {
             self.normalizer.update(fv);
         }
+    }
+
+    /// Inject reader decode diagnostics for testing `day_summary()` surfacing
+    /// without driving a (data-gated) corrupt `.dbn` stream through `stream_file`.
+    #[cfg(test)]
+    pub(crate) fn set_decode_diagnostics_for_test(&mut self, errors: u64, truncated: bool) {
+        self.decode_errors = errors;
+        self.decode_truncated = truncated;
     }
 }
 
@@ -981,7 +1017,7 @@ mod tests {
         let export = pipeline.finalize().unwrap();
 
         // Normalization used all 10 bins
-        let result = export.normalizer.finalize("test");
+        let result = export.normalizer.finalize("test", "per_day_zscore");
         assert_eq!(result.sample_count, 10, "Normalization should use all 10 bins");
         // But only 6 sequences exported (bins 0-7 valid, window=3, stride=1)
         assert_eq!(export.sequences.len(), 6, "Only 6 sequences exported");
@@ -1066,6 +1102,32 @@ mod tests {
             pipeline.data_file_sha256, None,
             "data_file_sha256 must be cleared by reset() (per-day state)"
         );
+    }
+
+    #[test]
+    fn test_pipeline_day_summary_surfaces_decode_diagnostics() {
+        // ②: decode errors + truncation captured from the reader in stream_file
+        // must surface through day_summary() into the diagnostics sidecar (§8),
+        // and be cleared by reset() (per-day state — no cross-day leak).
+        let config = test_config();
+        let mut pipeline = DayPipeline::new(&config).unwrap();
+
+        // Fresh pipeline: clean decode health.
+        let s0 = pipeline.day_summary();
+        assert_eq!(s0.decode_errors, 0);
+        assert!(!s0.decode_truncated);
+
+        // Simulate a partially-corrupt + truncated day.
+        pipeline.set_decode_diagnostics_for_test(7, true);
+        let s1 = pipeline.day_summary();
+        assert_eq!(s1.decode_errors, 7, "decode_errors must surface into DaySummary");
+        assert!(s1.decode_truncated, "truncation flag must surface into DaySummary");
+
+        // reset() clears per-day decode state.
+        pipeline.reset();
+        let s2 = pipeline.day_summary();
+        assert_eq!(s2.decode_errors, 0, "decode_errors must be cleared by reset()");
+        assert!(!s2.decode_truncated, "decode_truncated must be cleared by reset()");
     }
 
     #[test]

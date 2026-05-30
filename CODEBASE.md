@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 505 tests
-cargo test --lib               # Run 442 lib tests only
+cargo test                     # Run all 509 tests
+cargo test --lib               # Run 446 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -134,7 +134,7 @@ Categorical (non-normalizable): [29, 30, 32, 33]
 | `{day}_forward_prices.npy` | [N, 61] | float64 | USD |
 | `{day}_metadata.json` | — | JSON | all spec fields |
 | `{day}_normalization.json` | — | JSON | per-feature stats |
-| `{day}_diagnostics.json` | — | JSON | per-day health counters (`DaySummary`); `schema_version` 1.0.0 |
+| `{day}_diagnostics.json` | — | JSON | per-day health counters (`DaySummary`); `schema_version` 1.2.0 (1.1.0 added `dropped_invalid_price_trades`; 1.2.0 added `decode_errors` + `decode_truncated`) |
 
 The multi-day `dataset_manifest.json` additionally carries `diagnostics_files` — a list of `<split>/<day>_diagnostics.json` relative paths aggregating the per-day sidecars. Per-day `{day}_metadata.json` also includes `provenance.git_commit` / `provenance.git_dirty` (captured at build time via `build.rs`) and `provenance.data_file_sha256` (streaming SHA-256 of the raw input `.dbn.zst`, for Databento-re-issue detection; omitted if hashing fails). The manifest also carries `zero_sequence_days` (ISO dates that streamed OK but produced 0 sequences; also present in `splits.*.days[]`, an explicit empty-day annotation).
 
@@ -186,7 +186,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (442 lib)
+## Test Inventory (446 lib)
 
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -198,12 +198,12 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | trade_classifier/*.rs | 55 | Signing, BJZZ, BVC golden values |
 | config.rs | 33 | All config types, validation, TOML roundtrip |
 | sampling/*.rs | 15 | EST/EDT, DST transition days, gap detection, session boundaries |
-| accumulator/*.rs | 73 | Sub-accumulators, reset, diagnostics, volumes |
+| accumulator/*.rs | 75 | Sub-accumulators, reset, diagnostics, volumes, invalid-price guard (①) |
 | features/*.rs | 32 | All 34 formulas, indices, classification, sign-convention contract (§10), golden value tests (#11) |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
 | labeling/*.rs | 22 | Point-return, forward prices, golden tests |
-| export/*.rs | 46 | NPY shapes, normalization, metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
-| pipeline.rs | 12 | Finalize, alignment, determinism, per-day provenance reset |
+| export/*.rs | 47 | NPY shapes, normalization (strategy-threading ③), metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
+| pipeline.rs | 13 | Finalize, alignment, determinism, per-day provenance reset, decode-diagnostics surfacing (②) |
 | context.rs | 11 | EQUS loading, fallback, date lookup |
 | dates.rs | 12 | Weekday enum, split, date parsing |
 | **Integration** (tests/) | 47 | Real NVIDIA data, full pipeline, shapes |
@@ -232,6 +232,12 @@ These were identified during a 3-agent deep audit of all 41 source files. None a
 - **No `Sampler` trait** — `TimeBinSampler` is hardwired in `pipeline.rs`. Extract trait when adding volume-based or composite sampling.
 - **BVC uses sample variance (n-1), BurstTracker uses population variance (n)** — both defensible for their contexts (BVC estimates population parameter from sample, BurstTracker is descriptive statistic of bin data).
 - **`ExportMetadata.normalization.strategy` is hardcoded to `"per_day_zscore"`** — **RESOLVED in Phase 9.5** — strategy is now configurable via `ExportMetadataBuilder::normalization_strategy(&str)` and defaults to `"none"`. The CLI (`export_dataset.rs`) threads `config.export.normalization` into the builder via `DayPipeline::set_normalization_strategy(String)`.
+
+<!-- 2026-05-30 adversarial validation audit (5 fresh-eyes module auditors + 2 REFUTE agents, ground-truth code over docs): the module is SOUND — all 34 feature formulas, the BVC/BJZZ/midpoint math, temporal alignment (leakage-free), DST offsets (hand-verified), determinism, reset semantics, and the producer↔Python-consumer contract verified correct. Three actionable items were found and fixed (below). Deferred/blocked: the `hft-statistics` `branch="main"` pin → tag migration is cross-repo blocked (changes the compiled DST path; the committed Cargo.lock pins rev `e976ff7` so a given build IS reproducible — see M-2 note); the idx-2 inverted-polarity is a downstream contract-doc note (below); `git_dirty` is tracked-files-only (honestly documented at `metadata.rs`). -->
+- **Invalid/sentinel-price trades were accumulated unguarded (BVC σ-window poisoning)** — **RESOLVED (2026-05-30)** — `BinAccumulator::accumulate()` now skips trades with `price <= 0` or non-finite (the `0.0` sentinel `TradeClassifier::classify` emits for UNDEF/non-positive prices), per `docs/design/03_DATA_FLOW.md §"Price sanity"`. Previously such a trade poisoned the BVC sigma window (and the next trade's delta) and its real `size` inflated volume/count/size features, while the sibling VPIN consumer already guarded the identical input. The drop is counted in `DaySummary.dropped_invalid_price_trades` and surfaced in the diagnostics sidecar (hft-rules §8). Tests: `accumulator::tests::{test_accumulate_skips_invalid_sentinel_price, test_accumulate_processes_valid_price_unaffected_by_guard}`.
+- **Reader decode errors were never persisted (silent-truncation blind spot)** — **RESOLVED (2026-05-30)** — `RecordIterator` now exposes `aborted()`; `DayPipeline::stream_file` captures `decode_errors` + the abort/truncation flag, and `day_summary()` surfaces them as `DaySummary.{decode_errors, decode_truncated}` → diagnostics sidecar (§8). A partially-corrupt or 1000-consecutive-error-truncated day is now visible offline instead of looking clean (`total_records_processed` counts only successes, so it was not a proxy). Test: `pipeline::tests::test_pipeline_day_summary_surfaces_decode_diagnostics`.
+- **`{day}_normalization.json` sidecar `strategy` was hardcoded `"per_day_zscore"`** (the SIDECAR analog of the metadata fix above) — **RESOLVED (2026-05-30)** — `NormalizationComputer::{finalize,to_json}` now take `strategy: &str` threaded from `DayPipeline.normalization_strategy` (→ `"none"` for raw v3p0-style exports), so the sidecar's reported strategy matches `metadata.json` + the actual on-disk data (hft-rules §11). Previously the sidecar self-contradicted metadata; no consumer was misled (the Python validator reads the metadata strategy, not the sidecar's), so this is an artifact-honesty fix. Test: `normalization::tests::test_finalize_strategy_is_threaded_not_hardcoded`. NOTE: the live stale `basic_nvda_60s/` export keeps its old `"per_day_zscore"` sidecar until re-exported (Roadmap #33); root `CLAUDE.md` §Cross-Module Data Contracts still describes that stale on-disk value.
+- **idx-2 `inv_inst_direction` has the INVERTED sign convention vs all other signed features** — by design (`= -MROIB`, documented at `features/indices.rs`), correct and tested. Downstream contract-clarity note: a fusion/normalization layer applying a uniform "positive=bullish" polarity across the signed-flow block (idx 0-3) would invert this one signal; consult the per-feature polarity, do not assume uniformity.
 - **`ExportMetadata.feature_groups_enabled` and `.classification_config` emitted as empty `{}`** — **RESOLVED in Phase 9.4 / F2** — `pipeline.rs::finalize()` now serializes the active `FeatureConfig` and `ClassificationConfig` via `serde_json::to_value(&...)` and threads them into the builder, so metadata carries the actual config values alongside `config_hash`.
 - **`ExportMetadata.provenance.source_file` emitted as empty string** — **RESOLVED in Phase 9.4 / F1** — `DayPipeline::set_source_file(String)` is called by the CLI per-day with the `.dbn.zst` basename (cleared by `reset()`).
 - **No `forward_prices` metadata block** — **RESOLVED in Phase 9.1** — `ExportMetadata::forward_prices: Option<ForwardPricesMeta>` with 6 fields matching `contracts/pipeline_contract.toml [forward_prices.metadata]` and `hft-contracts.ForwardPriceContract.from_metadata()`. Unblocks T9 LabelFactory pathway for BASIC-only training.

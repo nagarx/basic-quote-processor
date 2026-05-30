@@ -305,7 +305,11 @@ fn test_normalization_json_34_features() {
     let parsed: serde_json::Value =
         serde_json::from_str(&export.normalization_json).unwrap();
 
-    assert_eq!(parsed["strategy"], "per_day_zscore");
+    // ③: the sidecar's `strategy` now reflects the CONFIGURED strategy (unset
+    // here → "none"), matching `metadata.json` (contract_conformance_test
+    // asserts the same "none" on the metadata side), instead of the previously
+    // hardcoded "per_day_zscore" that contradicted the metadata + the raw data.
+    assert_eq!(parsed["strategy"], "none");
     let features = parsed["features"].as_array().unwrap();
     assert_eq!(features.len(), TOTAL_FEATURES, "Should have 34 feature stats");
 
