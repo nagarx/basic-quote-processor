@@ -539,10 +539,15 @@ mod tests {
         ));
         assert!(acc.flow.trf_buy_vol > 0.0);
         assert!(acc.counts.trf_trades > 0);
+        assert!(acc.stats.total_volume > 0.0, "trade should populate stats.total_volume");
 
         acc.reset_bin();
         assert_eq!(acc.flow.trf_buy_vol, 0.0, "Per-bin flow should reset");
         assert_eq!(acc.counts.trf_trades, 0, "Per-bin counts should reset");
+        assert_eq!(
+            acc.stats.total_volume, 0.0,
+            "Per-bin stats should reset (#14 — load-bearing for the H2 half-day safety argument)"
+        );
         assert_eq!(acc.bin_index(), 1, "bin_index should increment");
         // BVC persists (sigma state is internal, just verify no panic)
         let _ = acc.bvc.window_size();

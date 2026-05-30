@@ -13,8 +13,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 504 tests
-cargo test --lib               # Run 441 lib tests only
+cargo test                     # Run all 505 tests
+cargo test --lib               # Run 442 lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -186,7 +186,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (441 lib)
+## Test Inventory (442 lib)
 
 | File | Tests | Coverage |
 |------|-------|---------|
@@ -197,7 +197,7 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 | bbo_state/*.rs | 37 | BBO tracking, midpoint, validation, edge cases |
 | trade_classifier/*.rs | 55 | Signing, BJZZ, BVC golden values |
 | config.rs | 33 | All config types, validation, TOML roundtrip |
-| sampling/*.rs | 14 | EST/EDT, gap detection, session boundaries |
+| sampling/*.rs | 15 | EST/EDT, DST transition days, gap detection, session boundaries |
 | accumulator/*.rs | 73 | Sub-accumulators, reset, diagnostics, volumes |
 | features/*.rs | 32 | All 34 formulas, indices, classification, sign-convention contract (§10), golden value tests (#11) |
 | sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
@@ -258,7 +258,7 @@ A 4-agent ground-truth re-validation (depend-on-code-not-docs) reclassified the 
 A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the safety net without requiring code changes:
 
 1. **Half-day auto-detect unit test** — inject 10 synthetic empty bins; assert `set_session_end()` is called. Currently relies on Christmas Eve real-data file.
-2. **DST transition tests** — `TimeBinSampler::init_day(2025, 3, 9)` (spring forward) and `(2025, 11, 2)` (fall back); verify offset switches.
+2. **DST transition tests** — `TimeBinSampler::init_day(2025, 3, 9)` (spring forward) and `(2025, 11, 2)` (fall back); verify offset switches. **RESOLVED (2026-05-30)**: `test_init_day_dst_transition_days` asserts the spring-forward day (2025-03-09 → EDT -4) + fall-back day (2025-11-02 → EST -5) + the Saturday-before each (opposite regime), bracketing both transition boundaries.
 3. **File with only trades, no quotes** — verify `TradeClassifier` correctly returns `Unsigned + Unknown` for all trades when no BBO updates exist.
 4. **Truly empty `.dbn.zst` file** — current `test_edge_empty_iterator` uses `.take(0)`; need a test on a zero-record file.
 5. **Convert `debug_assert!` → `assert!` in `src/features/mod.rs:164-179`** for safety_gates, schema_version, session_progress range — **RESOLVED in commit 8e46608 (2026-05-28)** — 6 `debug_assert!` calls promoted to `assert!`, enforcing `bin_valid`, `bbo_valid`, `schema_version`, `session_progress` invariants in release builds. One `debug_assert!` for `extract_context` regime sanity remains intentional (covered by `match` exhaustiveness).
@@ -270,7 +270,7 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 11. **Missing golden tests** for 10 features: `retail_volume_fraction`, `quote_imbalance`, `spread_change_rate`, `mean_trade_size`, `block_trade_ratio`, `trf_lit_volume_ratio`, `odd_lot_ratio`, `retail_trade_rate`, `time_bucket` regimes 4/5, VPIN fallback. **RESOLVED (2026-05-30)**: 10 golden/value tests in `features/mod.rs` (hand-derived from §5 formulas) — shared `extract_trf_trades` helper for the count/volume ratios; inline setup for `spread_change_rate` (`accumulate_bbo_update`), `time_bucket` regimes 4/5 (afternoon/close-auction boundaries), and the VPIN fallback (vpin-enabled config → `current_vpin()` None → exactly 0.0).
 12. **`git_commit` / `git_dirty` provenance via `build.rs`** — **RESOLVED (2026-05-29)** — `build.rs` shells to `git rev-parse HEAD` + `git diff --quiet HEAD` at compile time, exposing `GIT_COMMIT_HASH`/`GIT_DIRTY` rustc-env vars consumed via `option_env!` in `ProvenanceMeta` (`src/export/metadata.rs`), which now emits `git_commit` + `git_dirty` ("unknown"/false fallback). Mirrors the MBO extractor `build.rs`. Crate version also bumped `0.1.0` → `0.9.0` so `processor_version` is a meaningful staleness signal.
 13. **Frozen golden-hash regression test** — **RESOLVED in commit 8e46608 (2026-05-28)** — `test_config_hash_golden_regression` in `src/config.rs` pins SHA-256 `c142f46663ae401bd9ae3250b3f7e9d3047b09db425d19050aecfdbb22ea11fa` for the `sample_processor_config()` fixture; detects drift from serde_derive, toml minor version bumps, or accidental struct-field reordering.
-14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+).
+14. **`reset_bin` implicitly clears stats** — load-bearing invariant for the H2 half-day safety argument. Add a named test asserting the invariant (Phase 10+). **RESOLVED (2026-05-30)**: `test_reset_bin_zeros_per_bin_preserves_persistent` (already covered flow/counts/bin_index/bvc) strengthened with a `stats.total_volume` clearing assertion — the per-bin StatsAccumulator was the one sub-accumulator the named test had not covered.
 15. **`validate_off_exchange_export_contract`** (Python consumer) does not yet validate the `forward_prices` block presence/shape — add in `hft-contracts` alongside Phase 10.
 
 ### Phase 10+ Roadmap (surfaced by Round 8 agent validation)

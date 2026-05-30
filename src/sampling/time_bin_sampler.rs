@@ -269,6 +269,28 @@ mod tests {
     }
 
     #[test]
+    fn test_init_day_dst_transition_days() {
+        // #2: the DST CHANGE days themselves (the existing tests only cover Feb
+        // deep-EST + June deep-EDT). DST begins on the 2nd Sunday of March and
+        // ends on the 1st Sunday of November. For 2025: 2025-03-09 is the 2nd
+        // Sunday of March (spring forward — the trading session is already EDT,
+        // -4); 2025-11-02 is the 1st Sunday of November (fall back — the session
+        // is EST, -5). The Saturdays immediately before are the opposite regime,
+        // which brackets each transition boundary.
+        let cases = [
+            (2025, 3, 8, -5, "2025-03-08 (Sat before spring-forward) is still EST"),
+            (2025, 3, 9, -4, "2025-03-09 (spring-forward day) session is EDT"),
+            (2025, 11, 1, -4, "2025-11-01 (Sat before fall-back) is still EDT"),
+            (2025, 11, 2, -5, "2025-11-02 (fall-back day) session is EST"),
+        ];
+        for (y, m, d, expected_offset, msg) in cases {
+            let mut sampler = TimeBinSampler::new(60);
+            sampler.init_day(y, m, d, OPEN_SECS, CLOSE_SECS);
+            assert_eq!(sampler.utc_offset_hours(), expected_offset, "{msg}");
+        }
+    }
+
+    #[test]
     fn test_no_boundary_within_first_bin() {
         let mut sampler = TimeBinSampler::new(60);
         sampler.init_day(2025, 2, 3, OPEN_SECS, CLOSE_SECS);
