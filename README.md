@@ -2,6 +2,8 @@
 
 Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Extracts 34 off-exchange features from Nasdaq consolidated L1 quotes and trade prints, with TRF trade signing (Barber 2024), BJZZ retail identification (Boehmer 2021), and BVC volume classification (Easley 2012).
 
+> **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: a Rust processor turning XNAS.BASIC CMBP-1 (L1 NBBO + off-exchange TRF trades) into 34 features + point-return labels at configurable time-bins — a cheaper, quote-level data on-ramp (no full order book required). For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
+
 ## Overview
 
 This crate processes Databento XNAS.BASIC CMBP-1 files — consolidated Level 1 quotes and trade prints from Nasdaq-listed securities. It identifies off-exchange (TRF) trades, classifies them by direction (midpoint signing) and retail status (BJZZ subpenny analysis), accumulates per-bin statistics, and exports 34-feature time series as NumPy arrays for downstream ML training.

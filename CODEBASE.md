@@ -2,6 +2,8 @@
 
 Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
+> **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: a Rust processor turning XNAS.BASIC CMBP-1 (L1 NBBO + off-exchange TRF trades) into 34 features + point-return labels at configurable time-bins — a cheaper, quote-level data on-ramp (no full order book required). For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
+
 **Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (481 tests: 418 lib + 63 integration)
 **Schema**: off_exchange 1.0 (independent of MBO schema 3.0)
 **Features**: 34 (indices 0-33), 10 groups
