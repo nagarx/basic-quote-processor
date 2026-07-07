@@ -2,6 +2,7 @@
 
 **Date**: 2026-03-22
 **Status**: APPROVED — **Implementation Status**: Phases 1-5 complete (412 tests)
+> **Note (2026-07-07)**: implementation-status stamps in this document are historical (Phase-5-era; "412 tests" is a Phase-5 snapshot) — for the live count run `cargo test`; current status lives in `CODEBASE.md`.
 **Repo**: `basic-quote-processor`
 **Contract Schema Version**: 1.0 (off-exchange feature space, independent of MBO 0-147)
 

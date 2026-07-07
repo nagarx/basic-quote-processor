@@ -1,6 +1,7 @@
 # Configuration Schema: basic-quote-processor TOML Reference
 
 **Status**: Reference Document — **Implementation Status**: Phases 1-5 complete (412 tests)
+> **Note (2026-07-07)**: implementation-status stamps in this document are historical (Phase-5-era; "412 tests" is a Phase-5 snapshot) — for the live count run `cargo test`; current status lives in `CODEBASE.md`.
 **Date**: 2026-03-22 (spec), 2026-03-23 (implementation aligned)
 **Scope**: Complete TOML configuration schema for the basic-quote-processor pipeline, including all parameters, validation rules, defaults, and rationale
 

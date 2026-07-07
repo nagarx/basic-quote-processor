@@ -4,6 +4,7 @@
 **Status**: APPROVED — **Implementation Status**: Phases 1-5 complete
 **Module**: `basic-quote-processor`
 **Test target**: ~105 (original) → **412 tests achieved** (365 lib + 47 integration across 5 test files)
+> **Note (2026-07-07)**: implementation-status stamps in this document are historical (Phase-5-era; the "412 / 365 lib / 47 integration / 5 test files" figures are a Phase-5 snapshot — a 6th integration file, `contract_conformance_test.rs`, was added later) — for live counts run `cargo test`; current status lives in `CODEBASE.md`.
 
 ---
 

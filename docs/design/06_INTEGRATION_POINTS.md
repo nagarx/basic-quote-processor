@@ -1,6 +1,7 @@
 # Integration Points: basic-quote-processor with HFT Pipeline
 
 **Status**: Design Specification — **Implementation Status**: Phases 1-5 complete (412 tests, NPY export + EQUS integration working)
+> **Note (2026-07-07)**: implementation-status stamps in this document are historical (Phase-5-era; "412 tests" is a Phase-5 snapshot) — for the live count run `cargo test`; current status lives in `CODEBASE.md`.
 **Date**: 2026-03-22 (spec), 2026-03-23 (implementation)
 **Scope**: How basic-quote-processor connects to the MBO pipeline, EQUS_SUMMARY data, hft-statistics, pipeline_contract.toml, and downstream consumers (trainer, backtester)
 

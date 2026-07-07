@@ -4,7 +4,7 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 > **Pipeline scope (2026-06-02).** This module is part of an **intraday trading research pipeline** — an experiment-first platform for discovering and validating *any* profitable **intraday** trading edge (no overnight positions), across approach classes (microstructure/HFT, scalping, intraday momentum, intraday statistical arbitrage, …) and instruments (equities, futures, same-day options). The pipeline *originated* as a high-frequency NVDA MBO/LOB microstructure system — that origin explains the "HFT" / "LOB" / "MBO" naming here — and that microstructure-direction program is now one (largely-closed) track among many. **Names are historical; the mission is general.** This module's role: a Rust processor turning XNAS.BASIC CMBP-1 (L1 NBBO + off-exchange TRF trades) into 34 features + point-return labels at configurable time-bins — a cheaper, quote-level data on-ramp (no full order book required). For the full mission + approach taxonomy + capability-readiness boundary, see root `CLAUDE.md` §Research Scope & Charter (+ `CROSS_ASSET_OFI_FINDINGS_AND_ISSUES_2026_06_01.md` §9).
 
-**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (481 tests: 418 lib + 63 integration)
+**Status**: Phases 1-5 complete + Phase 9 Experimentation Foundation complete (test counts are deliberately not hand-typed here per hft-rules §11 — run `cargo test` for the live count)
 **Schema**: off_exchange 1.0 (independent of MBO schema 3.0)
 **Features**: 34 (indices 0-33), 10 groups
 **Labels**: Point-return only (no smoothed), 8 horizons [1,2,3,5,10,20,30,60]
@@ -15,8 +15,8 @@ Off-exchange trade processing for XNAS.BASIC CMBP-1 data. Standalone Rust crate.
 
 ```bash
 cargo build --release          # Build lib + 3 CLI binaries
-cargo test                     # Run all 512 tests
-cargo test --lib               # Run 449 lib tests only
+cargo test                     # Run all tests (lib + integration)
+cargo test --lib               # Run lib tests only
 cargo clippy --all-targets     # Lint check
 ```
 
@@ -77,7 +77,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
 | `features/` | 2 | 34-feature extraction with 3-level empty bin policy |
 | `sequence_builder/` | 1 | Sliding window, FeatureVec = Arc<Vec<f64>> |
 | `labeling/` | 3 | Point-return labels + forward price trajectories |
-| `export/` | 5 | NPY writing (f32/f64), normalization stats, metadata JSON, manifest |
+| `export/` | 6 | NPY writing (f32/f64), normalization stats, metadata JSON, manifest, diagnostics sidecar |
 | `pipeline.rs` | 1 | DayPipeline orchestrator: init_day → stream_file → finalize |
 | `context.rs` | 1 | EQUS_SUMMARY daily context (consolidated volume, OHLCV) |
 | `dates.rs` | 1 | Weekday enumeration, train/val/test split, date format helpers |
@@ -96,7 +96,7 @@ profile_data --config configs/nvda_60s.toml --date 2025-02-03
 | `DaySummary` | accumulator | Day-level diagnostics (cumulative trades, volumes, timestamps) |
 | `FeatureExtractor` | features | Stateless: reads accumulator → produces Vec<f64> |
 | `FeatureVec` | sequence_builder | `Arc<Vec<f64>>` for zero-copy window sharing |
-| `DayPipeline` | pipeline | Per-day orchestrator: 15 fields, split lifecycle |
+| `DayPipeline` | pipeline | Per-day orchestrator: 23 fields (incl. Phase-9 provenance/diagnostics), split lifecycle |
 | `DayExport` | export | Bundle: sequences + labels + forward_prices + metadata |
 | `DayExporter` | export | Atomic file writer with rollback on failure |
 | `DatasetManifest` | export/manifest | Multi-day export manifest with completion tracking |
@@ -188,27 +188,29 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 
 ---
 
-## Test Inventory (449 lib)
+## Test Inventory
 
-| File | Tests | Coverage |
-|------|-------|---------|
-| contract.rs | 9 | Constants, names, horizons |
-| error.rs | 8 | All error variants |
-| hash.rs | 4 | Streaming SHA-256 of a file (empty / known-vector / multichunk / error) |
-| reader/*.rs | 15 | Record types, publisher IDs, file discovery |
-| bbo_state/*.rs | 37 | BBO tracking, midpoint, validation, edge cases |
-| trade_classifier/*.rs | 57 | Signing, BJZZ, BVC golden values, BVC sigma-window eviction (mutation-proven: shrink + strict-`>` boundary) |
-| config.rs | 33 | All config types, validation, TOML roundtrip |
-| sampling/*.rs | 15 | EST/EDT, DST transition days, gap detection, session boundaries |
-| accumulator/*.rs | 76 | Sub-accumulators, reset, diagnostics, volumes, invalid-price guard (①), forward-fill index SSoT lock (slot tables ↔ `indices::*`) |
-| features/*.rs | 32 | All 34 formulas, indices, classification, sign-convention contract (§10), golden value tests (#11) |
-| sequence_builder/ | 11 | Sliding window, Arc sharing, stride |
-| labeling/*.rs | 22 | Point-return, forward prices, golden tests |
-| export/*.rs | 47 | NPY shapes, normalization (strategy-threading ③), metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
-| pipeline.rs | 13 | Finalize, alignment, determinism, per-day provenance reset, decode-diagnostics surfacing (②) |
-| context.rs | 11 | EQUS loading, fallback, date lookup |
-| dates.rs | 12 | Weekday enum, split, date parsing |
-| **Integration** (tests/) | 47 | Real NVIDIA data, full pipeline, shapes |
+> Per-file test counts are deliberately NOT hand-maintained here (hft-rules §11 — they drift; a 2026-07-07 audit found the previous counts stale by exactly the Phase-9 additions). For live counts run `cargo test` (totals) or `grep -rc '#\[test\]' src/ tests/` (per-file).
+
+| File | Coverage |
+|------|---------|
+| contract.rs | Constants, names, horizons |
+| error.rs | All error variants |
+| hash.rs | Streaming SHA-256 of a file (empty / known-vector / multichunk / error) |
+| reader/*.rs | Record types, publisher IDs, file discovery |
+| bbo_state/*.rs | BBO tracking, midpoint, validation, edge cases |
+| trade_classifier/*.rs | Signing, BJZZ, BVC golden values, BVC sigma-window eviction (mutation-proven: shrink + strict-`>` boundary) |
+| config.rs | All config types, validation, TOML roundtrip, canonical serialization + golden config-hash regression (Phase 9.3) |
+| sampling/*.rs | EST/EDT, DST transition days, gap detection, session boundaries |
+| accumulator/*.rs | Sub-accumulators, reset, diagnostics, volumes, invalid-price guard (①), forward-fill index SSoT lock (slot tables ↔ `indices::*`) |
+| features/*.rs | All 34 formulas, indices, classification, sign-convention contract (§10), golden value tests (#11) |
+| sequence_builder/ | Sliding window, Arc sharing, stride |
+| labeling/*.rs | Point-return, forward prices, golden tests |
+| export/*.rs | NPY shapes, normalization (strategy-threading ③), metadata, manifest, diagnostics sidecar, data_file_sha256, zero_sequence_days |
+| pipeline.rs | Finalize, alignment, determinism, per-day provenance reset, decode-diagnostics surfacing (②) |
+| context.rs | EQUS loading, fallback, date lookup |
+| dates.rs | Weekday enum, split, date parsing |
+| **Integration** (tests/, 6 files) | 5 data-gated files (real NVIDIA data, full pipeline, shapes) + `contract_conformance_test.rs` (data-less: validates `ExportMetadata` JSON conformance against a hand-mirrored copy of the Python validator's required-field list — it does NOT read `pipeline_contract.toml` or reference `FEATURE_NAMES`) |
 
 ---
 
@@ -220,7 +222,6 @@ Half-day detection: 10 consecutive empty bins → break + set_session_end().
 - Half-day detection pre-detection bins have ~2% session_progress error (accepted AD1)
 - `equs_summary_path` optional (spec says required, code overrides for library usability — AD2)
 - Phase 6 (Python analysis scripts) not yet implemented — all analysis performed via `lob-dataset-analyzer` on the exported NPY files
-- Phase 6 (Python analysis scripts) not yet implemented
 - Single-feed XNAS.BASIC coverage = 61.2% (not 81-85% which requires multi-feed fusion)
 
 ### Validated Design Items (Post-Push Improvements)
@@ -248,7 +249,7 @@ These were identified during a 3-agent deep audit of all 41 source files. None a
 - **`ExportMetadata.provenance.source_file` emitted as empty string** — **RESOLVED in Phase 9.4 / F1** — `DayPipeline::set_source_file(String)` is called by the CLI per-day with the `.dbn.zst` basename (cleared by `reset()`).
 - **No `forward_prices` metadata block** — **RESOLVED in Phase 9.1** — `ExportMetadata::forward_prices: Option<ForwardPricesMeta>` with 6 fields matching `contracts/pipeline_contract.toml [forward_prices.metadata]` and `hft-contracts.ForwardPriceContract.from_metadata()`. Unblocks T9 LabelFactory pathway for BASIC-only training.
 - **H2: final partial bin drop** — **RESOLVED in Phase 9.2** — `pipeline.rs` and `tests/phase3_test.rs` final-flush condition now `has_trades() || bbo_update_count() > 0`. BBO-only bins are emitted into `feature_bins` but filtered out of sequences via `valid_mask` (all-NaN labels since no `t+h` bins exist beyond).
-- **BUG-X2: `is_empty = trf_trades == 0` at `pipeline.rs:307` excludes lit-only bins** — DEFERRED (LOW severity, diagnostic counters only; does not affect labels/sequences).
+- **BUG-X2: `is_empty = trf_trades == 0` in `emit_bin()` (`src/pipeline.rs` — line anchors drift; grep for `trf_trades() == 0`) excludes lit-only bins** — DEFERRED (LOW severity, diagnostic counters only; does not affect labels/sequences).
 
 ### Audit Findings — Ground-Truth Verdicts (2026-05-29 re-validation)
 
@@ -327,10 +328,10 @@ A 5-agent audit identified P1 coverage gaps. Adding these tests strengthens the 
 
 **bqp is validated SOUND.** A from-scratch adversarial audit (5 fresh-eyes module auditors + 2 REFUTE agents, ground-truth code over docs, converged findings) verified correct: all 34 feature formulas, the BVC/BJZZ/midpoint math, leakage-free feature→label alignment, DST offsets (hand-verified at all 4 transition dates), determinism, reset semantics, and the producer↔Python-consumer contract; §0 reuse-first is clean. The 3 actionable findings it surfaced are FIXED (① invalid-price accumulation guard, ② decode-error observability, ③ normalization-sidecar honesty — see the Validated Design Items section + commit `8d091ee`). A follow-on 2026-05-30 coverage-hardening cycle (2 audit + 2 adversarial agents) then added TWO TEST-ONLY guards (lib 446→449, ZERO production change → config_hash / M-2 patch / determinism untouched; shipped as `419cad0`): the BVC sigma-window eviction tests (mutation-proven to bite `>`→`>=` and eviction-disabled) + the forward-fill index SSoT lock — closing the one correctness-critical untested path (idx-3 `bvc_imbalance`) + the one unlocked single-source-of-truth seam (relevant for future feature-set extensions). Two further candidates were adversarially **DEFERRED/DROPPED**: Roadmap #36 (0-seq-anomaly sidecar — safe design recorded, but unmotivated by any observed case) and #37 (silent-EOF truncation — in-tree docs already honest; no sound in-band detector exists).
 
-- **bqp-internal work is now LOW-VALUE**: the remaining test gaps (#1 half-day auto-detect, #8 gap-bin-at-end, #9 `set_session_end`, #3 no-quotes, #4 empty-file — #3/#4 likely need a synthetic `.dbn` fixture) + the optional #34. Producer formula/sign/DST/reset/contract correctness is LOCKED by tests (449 lib + 16 data-less conformance).
+- **bqp-internal work is now LOW-VALUE**: the remaining test gaps (#1 half-day auto-detect, #8 gap-bin-at-end, #9 `set_session_end`, #3 no-quotes, #4 empty-file — #3/#4 likely need a synthetic `.dbn` fixture) + the optional #34. Producer formula/sign/DST/reset/contract correctness is LOCKED by tests (the lib suite + the data-less `contract_conformance_test.rs` suite; run `cargo test` for live counts).
 - **The HIGH-VALUE next work is CROSS-REPO and currently BLOCKED**: #31 `validate_export_dir` consumer gate in hft-contracts (the "monitorable" win), #32 hft-ops BASIC stage, #33 re-export — all need a sister-free hft-contracts/hft-ops and/or the external SSD. Do NOT start them from bqp. #35 (dep-pin) is a latent reproducibility item.
 - **Do NOT re-flag the audit's REFUTED non-bugs**: idx-2 `inv_inst_direction`'s inverted sign is INTENDED (`= -MROIB`; a downstream polarity-doc note only); the dep-pin "reproducibility risk" is OVER-STATED (the committed lock pins `e976ff7`; the patch is dormant by design — see #35).
-- **Stale pointer**: root `SESSION_HANDOFF_2026_05_29.md` predates this cycle; the current state is THIS section + commit `8d091ee` + the git log (+ agent memory `project_2026_05_27_bqp_audit.md` Follow-on 5 for full detail).
+- **Stale pointer**: root `SESSION_HANDOFF_2026_05_29.md` (archived 2026-07-06 to root `.archive/2026-07-06-root-md-cleanup/SESSION_HANDOFF_2026_05_29.md`) predates this cycle; the current state is THIS section + commit `8d091ee` + the git log (+ agent memory `project_2026_05_27_bqp_audit.md` Follow-on 5 for full detail).
 
 ---
 

@@ -1,6 +1,7 @@
 # Module Architecture: basic-quote-processor
 
 **Status**: Design Specification — **Implementation Status**: Phases 1-5 complete (412 tests, 41 source files, 3 CLI binaries)
+> **Note (2026-07-07)**: implementation-status stamps in this document are historical (Phase-5-era; "412 tests / 41 source files" is a Phase-5 snapshot) — for live counts run `cargo test` / `find src -name '*.rs' | wc -l`; current status lives in `CODEBASE.md`.
 **Date**: 2026-03-22 (spec), 2026-03-23 (implementation)
 **Scope**: Repository structure, module boundaries, key design decisions, and dependency map for the `basic-quote-processor` crate
 **Prerequisite**: [01_THEORETICAL_FOUNDATION.md](01_THEORETICAL_FOUNDATION.md) -- mathematical and statistical foundations
@@ -75,11 +76,11 @@ basic-quote-processor/
 │       └── 07_TESTING_STRATEGY.md
 │
 ├── src/
-│   ├── lib.rs                      # Crate root: 13 public modules + Phase 1-5 re-exports
+│   ├── lib.rs                      # Crate root: 16 public modules + Phase 1-5 re-exports
 │   ├── error.rs                    # ProcessorError enum (8 variants) + Result alias
 │   ├── contract.rs                 # EPS, NANO_TO_USD, SCHEMA_VERSION, CONTRACT_VERSION,
 │   │                               #   DEFAULT_HORIZONS, FEATURE_NAMES[34], TOTAL_FEATURES
-│   ├── config.rs                   # ProcessorConfig, DatasetConfig + 10 sub-config structs
+│   ├── config.rs                   # ProcessorConfig, DatasetConfig + 11 sub-config structs + 3 enums
 │   ├── pipeline.rs                 # DayPipeline orchestrator: init -> stream -> finalize
 │   ├── context.rs                  # DailyContextLoader (EQUS_SUMMARY OHLCV-1D)
 │   ├── dates.rs                    # Weekday/Split enums, date parsing, file-name formatting
@@ -94,7 +95,7 @@ basic-quote-processor/
 │   │   └── publisher.rs            # PublisherClass enum + 6 named ID constants
 │   │
 │   ├── bbo_state/                  # L1 BBO tracking
-│   │   ├── mod.rs                  # BboState (14 fields, single i64→f64 conversion point)
+│   │   ├── mod.rs                  # BboState (12 fields, single i64→f64 conversion point)
 │   │   ├── midpoint.rs             # midpoint(), spread_bps(), microprice() pure functions
 │   │   └── validation.rs           # is_valid_bbo(), staleness_ns()
 │   │
