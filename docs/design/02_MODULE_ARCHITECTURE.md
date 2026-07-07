@@ -83,6 +83,7 @@ basic-quote-processor/
 │   ├── pipeline.rs                 # DayPipeline orchestrator: init -> stream -> finalize
 │   ├── context.rs                  # DailyContextLoader (EQUS_SUMMARY OHLCV-1D)
 │   ├── dates.rs                    # Weekday/Split enums, date parsing, file-name formatting
+│   ├── hash.rs                     # sha256_file(): streaming SHA-256 of the raw .dbn.zst (provenance)
 │   │
 │   ├── reader/                     # Data ingestion
 │   │   ├── mod.rs                  # Re-exports
@@ -135,6 +136,7 @@ basic-quote-processor/
 │   │   ├── npy_writer.rs           # write_sequences (f32), write_labels (f64), write_forward_prices (f64)
 │   │   ├── normalization.rs        # NormalizationComputer (per-feature Welford streaming)
 │   │   ├── metadata.rs             # ExportMetadata + builder pattern
+│   │   ├── diagnostics.rs          # DiagnosticsSidecar -> {day}_diagnostics.json (per-day health counters)
 │   │   └── manifest.rs             # DatasetManifest (multi-day completion tracking)
 │   │
 │   └── bin/                        # 3 CLI binaries
@@ -178,6 +180,7 @@ The following files were proposed in pre-implementation spec drafts but were nev
 | `pipeline.rs` | `DayPipeline` orchestrator: per-day processing lifecycle (`init_day` → `stream_file` → `finalize`). Owns all sub-modules. |
 | `context.rs` | `DailyContextLoader` reads EQUS_SUMMARY OHLCV-1D for per-day consolidated volume context. |
 | `dates.rs` | Weekday enumeration, train/val/test split assignment, date format helpers. |
+| `hash.rs` | `sha256_file()` — streaming SHA-256 of the raw compressed `.dbn.zst` (hashes the delivered artifact, does NOT decompress). Set per-day via `DayPipeline::set_data_file_sha256` and threaded into the optional `provenance.data_file_sha256` to detect a Databento re-issue (same-path/different-content). Reuses the `sha2` dep (also behind `ProcessorConfig::config_hash_hex`); deliberately NOT `hft_statistics::io` — that would activate the `.cargo/config.toml` `[[patch.unused]]` override and churn the dep graph (CODEBASE.md "Audit Findings" §M-2). |
 | `bin/export_dataset.rs` | Production CLI: iterates days, calls `DayPipeline`, writes NPY/JSON via `DayExporter`. |
 | `bin/profile_data.rs` | Diagnostic CLI: prints per-day statistics (trade counts, volumes, BBO update rates). |
 | `bin/validate_coverage.rs` | Validation CLI: cross-checks TRF/lit volumes against EQUS_SUMMARY consolidated volume. |
@@ -511,17 +514,18 @@ Volume-based sampling (VPIN computation) lives inside `accumulator/` (bucket-vol
 
 ### 4.9 export/ -- NPY/JSON Export
 
-**Responsibility**: Write sequences, labels, forward prices, metadata, manifest, and normalization stats to disk in the pipeline's standard export format.
+**Responsibility**: Write sequences, labels, forward prices, metadata, manifest, normalization stats, and the per-day diagnostics sidecar to disk in the pipeline's standard export format.
 
-**Files** (5):
+**Files**:
 
 | File | Purpose |
 |---|---|
-| `mod.rs` | `DayExporter` orchestrator + `DayExport` struct. Wires the per-day assembly (sequences + labels + forward_prices + metadata + normalization) and delegates file writes to the sub-modules. |
+| `mod.rs` | `DayExporter` orchestrator + `DayExport` struct. Wires the per-day assembly (sequences + labels + forward_prices + metadata + normalization + diagnostics) and delegates file writes to the sub-modules. All per-day files land in a temp-dir that is renamed into place (atomic-write envelope). |
 | `metadata.rs` | `ExportMetadata` struct + `ExportMetadataBuilder`. Writes `{day}_metadata.json` with all spec-required fields including `provenance.config_hash`, `provenance.source_file`, `forward_prices` (6-field block), `normalization` (honest strategy), `feature_groups_enabled` (active `FeatureConfig` snapshot), `classification_config`. |
 | `normalization.rs` | `NormalizationComputer` using `Welford` (from `hft-statistics`) for per-feature mean/std across all post-warmup bins. Excludes categorical indices (29, 30, 32, 33). Writes `{day}_normalization.json` with finalized statistics. |
 | `npy_writer.rs` | Writes NPY files via `ndarray-npy`. Handles f32 downcast for sequences (with `is_finite()` guard) and f64 for labels + forward prices. Emits three files per day: `{day}_sequences.npy`, `{day}_labels.npy`, `{day}_forward_prices.npy`. |
 | `manifest.rs` | `DatasetManifest` — the top-level `dataset_manifest.json` written to the export root. Tracks all processed days across train/val/test splits, aggregate statistics, and per-day status (success/failure with error message). |
+| `diagnostics.rs` | `DiagnosticsSidecar<'a>` — borrows a `DaySummary` (zero-copy) and serializes `{day}_diagnostics.json`: per-day health counters (records processed, empty/warmup/gap bins, TRF vs. lit trade + volume splits, first/last bin timestamps, dropped-invalid-price + decode-error counters). Owns the `BASIC_DIAGNOSTICS_SCHEMA_VERSION` constant (SemVer over the sidecar's JSON shape — MINOR bump on additive counters; independent of the feature-contract `SCHEMA_VERSION` and the MBO producer-diagnostics version). Written inside the `DayExporter` temp-dir + rename envelope, so it inherits atomic-write semantics; mirrors the MBO pipeline's `_diagnostics.json` producer-side health surface (hft-rules §8: never silently drop diagnostics). |
 
 **Input**: Sequences `[N, T, F]`, labels `[N, H]`, forward prices `[N, max_H+1]`, metadata struct
 **Output**: Files on disk in the export directory
@@ -532,7 +536,7 @@ Volume-based sampling (VPIN computation) lives inside `accumulator/` (bucket-vol
 ```
 data/exports/{experiment_name}/
     train/  {day}_sequences.npy, {day}_labels.npy, {day}_forward_prices.npy,
-            {day}_metadata.json, {day}_normalization.json
+            {day}_metadata.json, {day}_normalization.json, {day}_diagnostics.json
     val/    ...
     test/   ...
     dataset_manifest.json
@@ -547,6 +551,7 @@ data/exports/{experiment_name}/
 | `{day}_forward_prices.npy` | `[N, max_H+1]` | float64 | USD | Mid-price trajectory |
 | `{day}_metadata.json` | -- | JSON | -- | Schema, provenance, feature count |
 | `{day}_normalization.json` | -- | JSON | -- | Per-day mean/std per feature |
+| `{day}_diagnostics.json` | -- | JSON | -- | Per-day health counters (`DiagnosticsSidecar`) |
 | `dataset_manifest.json` | -- | JSON | -- | Split info, config, date lists |
 
 ---
